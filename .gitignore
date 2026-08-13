@@ -19,3 +19,9 @@ Thumbs.db
 
 # xmake
 .xmake/
+
+# Backup files
+*.bak
+
+# Auto-generated docs
+README.md

@@ -11,7 +11,6 @@
 #include <iostream>
 #include <sstream>
 #include <string>
-#include <vector>
 
 #include <opencv2/core.hpp>
 #include <opencv2/imgcodecs.hpp>
@@ -71,28 +70,28 @@ auto main(int argc, char* argv[]) -> int {
   double fps = reader.fps();
 
   // --- Test 2: Decode all frames ---
-  std::vector<double> inter_arrival_us;
-  inter_arrival_us.reserve(6000);
+  // Wall-clock timing: measure total decode time inside Reader, not
+  // the consumer-side polling latency (which is ~0us because
+  // latest_frame() is just an atomic load).
+  auto t_start = std::chrono::steady_clock::now();
   std::string first_frame_hash;
   int frame_count = 0;
 
   auto last_frame = reader.latest_frame();
-  auto last_arrival = std::chrono::steady_clock::now();
-  auto t_start = last_arrival;
 
+  // Same consumption pattern as Pipeline::reader_thread_fn:
+  // is_done() is checked ONLY when we get a duplicate frame, not in
+  // the loop condition. This ensures the last frame(s) are not
+  // missed due to a race between the final store() and done_=true.
   for (;;) {
     auto frame = reader.latest_frame();
 
     if (frame.get() == last_frame.get()) {
-      if (reader.is_done()) break;  // no more frames coming
+      if (reader.is_done()) break;
       std::this_thread::sleep_for(std::chrono::microseconds(100));
       continue;
     }
 
-    auto now = std::chrono::steady_clock::now();
-    auto dur = std::chrono::duration_cast<std::chrono::microseconds>(now - last_arrival);
-    inter_arrival_us.push_back(static_cast<double>(dur.count()));
-    last_arrival = now;
     last_frame = frame;
 
     if (frame && !frame->image.empty()) {
@@ -103,33 +102,16 @@ auto main(int argc, char* argv[]) -> int {
     }
   }
 
-  // Drain the final frame after done_
-  {
-    auto frame = reader.latest_frame();
-    if (frame.get() != last_frame.get() && frame && !frame->image.empty()) {
-      frame_count++;
-      if (frame_count == 1) {
-        first_frame_hash = frame_hash(frame->image);
-      }
-    }
-  }
-
   auto t_end = std::chrono::steady_clock::now();
-  auto total_wall_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_end - t_start).count();
+  auto total_decode_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_end - t_start);
+  double throughput_fps = (total_decode_ms.count() > 0)
+    ? (frame_count * 1000.0 / total_decode_ms.count()) : 0.0;
 
   reader.stop();
 
   // --- Compute statistics ---
-  if (!inter_arrival_us.empty()) {
-    std::sort(inter_arrival_us.begin(), inter_arrival_us.end());
-  }
-  double avg_inter = 0.0;
-  for (auto l : inter_arrival_us) avg_inter += l;
-  avg_inter /= inter_arrival_us.empty() ? 1.0 : static_cast<double>(inter_arrival_us.size());
-
-  double p50 = inter_arrival_us.empty() ? 0.0 : inter_arrival_us[inter_arrival_us.size() / 2];
-  double p99 = inter_arrival_us.empty() ? 0.0 : inter_arrival_us[inter_arrival_us.size() * 99 / 100];
-  double p_max = inter_arrival_us.empty() ? 0.0 : inter_arrival_us.back();
+  // Performance is measured by wall-clock throughput (total frames / total time),
+  // not by consumer-side polling latency (which is meaningless ~0us).
 
   // --- IMU validation ---
   auto frame = reader.latest_frame();
@@ -169,16 +151,14 @@ auto main(int argc, char* argv[]) -> int {
   std::cout << "      \"hash\": \"" << first_frame_hash << "\"\n";
   std::cout << "    },\n";
 
-  // TC5: Performance
+  // TC5: Performance (wall-clock throughput, not polling latency)
   std::cout << "    \"tc5_performance\": {\n";
-  std::cout << "      \"total_wall_ms\": " << total_wall_ms << ",\n";
-  std::cout << "      \"avg_inter_arrival_us\": " << std::fixed << std::setprecision(1) << avg_inter << ",\n";
-  std::cout << "      \"p50_inter_us\": " << p50 << ",\n";
-  std::cout << "      \"p99_inter_us\": " << p99 << ",\n";
-  std::cout << "      \"max_inter_us\": " << p_max << ",\n";
-  std::cout << "      \"throughput_fps\": " << std::fixed << std::setprecision(1)
-            << (total_wall_ms > 0 ? frame_count * 1000.0 / total_wall_ms : 0.0) << ",\n";
-  std::cout << "      \"video_fps\": " << std::fixed << std::setprecision(1) << fps << "\n";
+  std::cout << "      \"total_decode_ms\": " << total_decode_ms.count() << ",\n";
+  std::cout << "      \"throughput_fps\": " << std::fixed << std::setprecision(1) << throughput_fps << ",\n";
+  std::cout << "      \"video_fps\": " << std::fixed << std::setprecision(1) << fps << ",\n";
+  std::cout << "      \"realtime_factor\": " << std::fixed << std::setprecision(1)
+            << (throughput_fps / fps) << ",\n";
+  std::cout << "      \"total_frames\": " << frame_count << "\n";
   std::cout << "    }\n";
 
   std::cout << "  }\n";
@@ -194,10 +174,8 @@ auto main(int argc, char* argv[]) -> int {
     std::cout << "  \"height\": " << height << ",\n";
     std::cout << "  \"fps\": " << std::fixed << std::setprecision(1) << fps << ",\n";
     std::cout << "  \"imu_norm\": " << std::fixed << std::setprecision(6) << imu_norm << ",\n";
-    std::cout << "  \"latency_avg_inter_us\": " << std::fixed << std::setprecision(1) << avg_inter << ",\n";
-    std::cout << "  \"latency_p99_inter_us\": " << std::fixed << std::setprecision(1) << p99 << ",\n";
-    std::cout << "  \"throughput_fps\": " << std::fixed << std::setprecision(1)
-              << (total_wall_ms > 0 ? frame_count * 1000.0 / total_wall_ms : 0.0) << "\n";
+    std::cout << "  \"total_decode_ms\": " << total_decode_ms.count() << ",\n";
+    std::cout << "  \"throughput_fps\": " << std::fixed << std::setprecision(1) << throughput_fps << "\n";
     std::cout << "}\n";
     std::fclose(stdout);
     std::cout << "Baseline saved to " << baseline_path << "\n";
