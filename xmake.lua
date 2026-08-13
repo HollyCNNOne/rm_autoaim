@@ -41,3 +41,6 @@ target("rm_autoaim")
   -- System FFmpeg (direct link)
   add_links("avcodec", "avformat", "avutil", "swscale")
   add_syslinks("pthread")
+
+-- Module unit tests
+includes("tests/reader")
