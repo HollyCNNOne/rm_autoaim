@@ -13,12 +13,13 @@ namespace rm_autoaim {
 //
 // Detects outpost armor plates from a single BGR image frame.
 //
-// Pipeline:
-//   1. Color separation (HSV thresholding for orange/amber light bars)
-//   2. Morphological operations (open + close)
+// Optimized Pipeline (v2):
+//   1. CLAHE-enhanced HSV thresholding with dynamic V lower-bound
+//   2. Distance-adaptive morphological operations (temporal feedback)
 //   3. Contour extraction
-//   4. Light bar filtering (aspect ratio, area, convexity)
-//   5. Light bar pairing (5 geometric constraints)
+//   4. Relaxed light bar filtering → feature encoder (passes more
+//      candidates to Step 5 with per-bar feature vectors)
+//   5. Soft-scoring + sliding-window pruning + greedy conflict resolution
 //   6. Corner extraction (4 armor corners)
 // ============================================================================
 
@@ -40,17 +41,21 @@ private:
   // Sub-steps
   // ========================================================================
 
-  // Step 1: Color separation via HSV thresholding (orange/amber light bars)
+  // Step 1: CLAHE-enhanced color separation with dynamic V threshold
   [[nodiscard]] auto extract_color(const cv::Mat& bgr) const -> cv::Mat;
 
-  // Step 2: Morphological operations
-  [[nodiscard]] static auto apply_morphology(const cv::Mat& binary) -> cv::Mat;
+  // Step 2: Distance-adaptive morphological operations
+  // Uses prev_avg_lightbar_height_ to adapt the closing kernel size:
+  //   near (h > 100px) → 9×9;  mid (h > 50px) → 7×7;  far (h < 20px) → 3×3
+  [[nodiscard]] auto apply_morphology(const cv::Mat& binary) -> cv::Mat;
 
   // Step 3: Contour extraction
   [[nodiscard]] static auto extract_contours(const cv::Mat& binary)
       -> std::vector<std::vector<cv::Point>>;
 
-  // Step 4: Filter light bar candidates
+  // Step 4: Relaxed light bar filtering → feature encoder
+  // Thresholds widened ~20% vs. original; passes "suspicious" candidates
+  // to Step 5 so the cost function can make the final decision.
   struct LightBar {
     cv::RotatedRect rect;
     cv::Point2f center;
@@ -65,7 +70,17 @@ private:
       const std::vector<std::vector<cv::Point>>& contours)
       -> std::vector<LightBar>;
 
-  // Step 5: Pair light bars into armor plates
+  // Step 5: Soft-scoring + sliding-window + greedy conflict resolution
+  //
+  // Replaces hard if-thresholds with a continuous cost function:
+  //   Score = w1·f(Height) + w2·f(Angle) + w3·f(Y_offset) + w4·f(X_ratio)
+  //
+  // Algorithm:
+  //   A. Sort candidates by center.x
+  //   B. Sliding window: for each i, examine j in [i+1, i+max_search_range),
+  //      break early when x-distance exceeds max_allowed_distance
+  //   C. Sort all scored pairs by cost (ascending)
+  //   D. Greedy assignment with conflict resolution (used[] flag array)
   struct ArmorPair {
     LightBar left;
     LightBar right;
@@ -73,6 +88,11 @@ private:
 
   [[nodiscard]] static auto pair_light_bars(
       const std::vector<LightBar>& candidates) -> std::vector<ArmorPair>;
+
+  // Cost function: lower = better pairing
+  // Weights: height(0.35) + angle(0.25) + y-offset(0.20) + x-ratio(0.20)
+  [[nodiscard]] static auto compute_pair_cost(const LightBar& a,
+                                              const LightBar& b) -> double;
 
   // Step 6: Extract 4 corners from paired light bars
   [[nodiscard]] static auto extract_corners(const ArmorPair& pair)
@@ -85,6 +105,10 @@ private:
   // Parameters
   int diff_threshold_{80};
   bool detect_red_{true};  // default: detect red armor (enemy)
+
+  // Temporal feedback for adaptive morphology (Step 2)
+  // Updated every frame from the average height of filtered light bars.
+  float prev_avg_lightbar_height_{50.0F};
 };
 
 }  // namespace rm_autoaim
