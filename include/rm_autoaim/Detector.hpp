@@ -13,7 +13,7 @@ namespace rm_autoaim {
 //
 // Detects outpost armor plates from a single BGR image frame.
 //
-// Optimized Pipeline (v2):
+// Optimized Pipeline (v2.1):
 //   1. CLAHE-enhanced HSV thresholding with dynamic V lower-bound
 //   2. Distance-adaptive morphological operations (temporal feedback)
 //   3. Contour extraction
@@ -108,7 +108,7 @@ private:
 
   // Temporal feedback for adaptive morphology (Step 2)
   // Updated every frame from the average height of filtered light bars.
-  float prev_avg_lightbar_height_{50.0F};
+  float prev_avg_lightbar_height_{80.0F};  // conservative init: default 5×5 kernel
 };
 
 }  // namespace rm_autoaim

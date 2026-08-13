@@ -8,16 +8,17 @@
 namespace rm_autoaim {
 
 // ============================================================================
-// Relaxed thresholds for Step 4 (~20% wider than Types.hpp constants)
-// Widening allows "suspicious" candidates to reach Step 5 where the cost
-// function makes the final decision, rather than being killed by hard ifs.
+// Relaxed thresholds for Step 4 (~5% wider than Types.hpp constants)
+// Minimal widening: Step 4 is a "security guard" that must block ~80% of
+// obvious noise. Step 5 (cost function) is the "HR interviewer" for the
+// remaining borderline cases.
 // ============================================================================
 namespace {
 inline constexpr double kRelaxedMinAspectRatio{0.04};   // was 0.05
 inline constexpr double kRelaxedMaxAspectRatio{0.60};   // was 0.50
-inline constexpr double kRelaxedMinArea{16.0};          // was 20.0
+inline constexpr double kRelaxedMinArea{18.0};          // was 20.0
 inline constexpr double kRelaxedMaxArea{9600.0};        // was 8000.0
-inline constexpr double kRelaxedMinConvexity{0.32};     // was 0.40
+inline constexpr double kRelaxedMinConvexity{0.38};     // was 0.40
 }  // anonymous namespace
 
 // ============================================================================
@@ -31,16 +32,16 @@ auto Detector::detect(const cv::Mat& bgr_image) -> std::vector<Armor2D> {
     return results;
   }
 
-  // Step 1: CLAHE-enhanced color separation with dynamic V threshold
-  cv::Mat diff = extract_color(bgr_image);
-
-  // ROI: only process the upper half (outpost tower is in the upper portion)
+  // Step 1: ROI first, then CLAHE-enhanced color separation
+  // ROI must precede extract_color to avoid wasting 50% of CLAHE/inRange
+  // computation on the lower half (ground, no targets)
   auto roi_h = bgr_image.rows / 2;
   cv::Rect roi_rect(0, 0, bgr_image.cols, roi_h);
-  cv::Mat diff_roi = diff(roi_rect);
+  cv::Mat bgr_roi = bgr_image(roi_rect);
+  cv::Mat diff = extract_color(bgr_roi);
 
   // Step 2: Distance-adaptive morphology (uses prev_avg_lightbar_height_)
-  cv::Mat clean = apply_morphology(diff_roi);
+  cv::Mat clean = apply_morphology(diff);
 
   // Step 3: Contour extraction
   auto contours = extract_contours(clean);
@@ -98,14 +99,17 @@ auto Detector::extract_color(const cv::Mat& bgr) const -> cv::Mat {
   std::vector<cv::Mat> channels(3);
   cv::split(hsv, channels);
 
+  // Compute V-channel mean BEFORE CLAHE (raw lighting)
+  // CLAHE alters the distribution; using post-CLAHE mean would
+  // make the dynamic threshold blind to actual scene brightness
+  auto mean_v = cv::mean(channels[2])[0];
+  auto v_low = static_cast<int>(std::clamp(mean_v * 0.35, 60.0, 140.0));
+
+  // Apply CLAHE to V channel for local contrast enhancement
   auto clahe = cv::createCLAHE(2.0, cv::Size(8, 8));
   clahe->apply(channels[2], channels[2]);
 
   cv::merge(channels, hsv);
-
-  // Dynamic V lower-bound: adapt to mean scene brightness
-  auto mean_v = cv::mean(channels[2])[0];
-  auto v_low = static_cast<int>(std::clamp(mean_v * 0.35, 60.0, 140.0));
 
   cv::Mat mask;
 
@@ -162,12 +166,20 @@ auto Detector::apply_morphology(const cv::Mat& binary) -> cv::Mat {
   cv::morphologyEx(binary, result, cv::MORPH_OPEN, kernel_open);
 
   // Closing: adaptive kernel based on previous frame's light bar height
+  // Safety clamp: if prev_avg_lightbar_height_ is suspiciously large
+  // (>150px, likely a false-positive frame), cap at 7×7 to avoid
+  // over-merging small bars in the current frame.
   auto close_size = 5;
-  if (prev_avg_lightbar_height_ > 100.0F) {
+  auto effective_h = prev_avg_lightbar_height_;
+  if (effective_h > 150.0F) {
+    effective_h = 100.0F;  // clamp to mid-range
+  }
+
+  if (effective_h > 100.0F) {
     close_size = 9;
-  } else if (prev_avg_lightbar_height_ > 50.0F) {
+  } else if (effective_h > 50.0F) {
     close_size = 7;
-  } else if (prev_avg_lightbar_height_ < 20.0F) {
+  } else if (effective_h < 20.0F) {
     close_size = 3;
   }
 
@@ -295,11 +307,16 @@ auto Detector::compute_pair_cost(const LightBar& a, const LightBar& b)
                     ? std::min(static_cast<double>(y_diff / avg_h), 1.0)
                     : 1.0;
 
-  // --- f4: X-ratio deviation from ideal (ideal ≈ 2.45 for small armor) ---
+  // --- f4: X-ratio deviation from ideal ---
+  // Dual-scale: small armor (far, avg_h ≤ 60px) uses 2.45;
+  //             large armor (near, outpost, avg_h > 60px) uses 3.0
   auto x_dist = std::abs(a.center.x - b.center.x);
   auto x_ratio = (avg_h > 1e-6F) ? (x_dist / avg_h) : 0.0;
-  constexpr double kIdealXRatio = 2.45;
-  auto x_cost = std::min(std::abs(x_ratio - kIdealXRatio) / 3.0, 1.0);
+  constexpr double kIdealXRatioSmall = 2.45;
+  constexpr double kIdealXRatioLarge = 3.0;
+  const double ideal_xr =
+      (avg_h > 60.0F) ? kIdealXRatioLarge : kIdealXRatioSmall;
+  auto x_cost = std::min(std::abs(x_ratio - ideal_xr) / 3.0, 1.0);
 
   // Weighted sum (weights sum to 1.0)
   constexpr double kWeightHeight{0.35};
@@ -379,6 +396,11 @@ auto Detector::pair_light_bars(const std::vector<LightBar>& candidates)
                                                             : sorted[sp.li];
 
       pairs.push_back({left, right});
+
+      // Early termination: all bars paired, no need to scan remaining
+      if (pairs.size() >= n / 2) {
+        break;
+      }
     }
   }
 
