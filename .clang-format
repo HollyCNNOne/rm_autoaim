@@ -1,0 +1,30 @@
+---
+Language: Cpp
+Standard: Latest
+BasedOnStyle: Google
+
+IndentWidth: 2
+UseTab: Never
+ColumnLimit: 80
+BreakBeforeBraces: Attach
+NamespaceIndentation: None
+PointerAlignment: Right
+ReferenceAlignment: Pointer
+AccessModifierOffset: -2
+SpaceBeforeParens: ControlStatements
+SpacesInAngles: Never
+AllowShortFunctionsOnASingleLine: All
+AllowShortLambdasOnASingleLine: All
+FixNamespaceComments: true
+SortIncludes: Enabled
+IncludeBlocks: Preserve
+PenaltyExcessCharacter: 1000000
+AlignConsecutiveAssignments: false
+PackConstructorInitializers: BinPack
+
+# For header sorting order
+IncludeCategories:
+  - Regex: '^".*"'
+    Priority: 1
+  - Regex: '^<.*>'
+    Priority: 2
