@@ -71,28 +71,29 @@ auto main(int argc, char* argv[]) -> int {
   double fps = reader.fps();
 
   // --- Test 2: Decode all frames ---
-  std::vector<double> latencies;
-  latencies.reserve(6000);
+  std::vector<double> inter_arrival_us;
+  inter_arrival_us.reserve(6000);
   std::string first_frame_hash;
   int frame_count = 0;
-  int drop_count = 0;
 
   auto last_frame = reader.latest_frame();
+  auto last_arrival = std::chrono::steady_clock::now();
+  auto t_start = last_arrival;
 
-  while (!reader.is_done()) {
-    auto t0 = std::chrono::steady_clock::now();
+  for (;;) {
     auto frame = reader.latest_frame();
-    auto t1 = std::chrono::steady_clock::now();
 
     if (frame.get() == last_frame.get()) {
-      drop_count++;
+      if (reader.is_done()) break;  // no more frames coming
       std::this_thread::sleep_for(std::chrono::microseconds(100));
       continue;
     }
 
+    auto now = std::chrono::steady_clock::now();
+    auto dur = std::chrono::duration_cast<std::chrono::microseconds>(now - last_arrival);
+    inter_arrival_us.push_back(static_cast<double>(dur.count()));
+    last_arrival = now;
     last_frame = frame;
-    auto dur = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0);
-    latencies.push_back(static_cast<double>(dur.count()));
 
     if (frame && !frame->image.empty()) {
       frame_count++;
@@ -102,17 +103,33 @@ auto main(int argc, char* argv[]) -> int {
     }
   }
 
+  // Drain the final frame after done_
+  {
+    auto frame = reader.latest_frame();
+    if (frame.get() != last_frame.get() && frame && !frame->image.empty()) {
+      frame_count++;
+      if (frame_count == 1) {
+        first_frame_hash = frame_hash(frame->image);
+      }
+    }
+  }
+
+  auto t_end = std::chrono::steady_clock::now();
+  auto total_wall_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_end - t_start).count();
+
   reader.stop();
 
   // --- Compute statistics ---
-  std::sort(latencies.begin(), latencies.end());
-  double avg = 0.0;
-  for (auto l : latencies) avg += l;
-  avg /= latencies.empty() ? 1.0 : static_cast<double>(latencies.size());
+  if (!inter_arrival_us.empty()) {
+    std::sort(inter_arrival_us.begin(), inter_arrival_us.end());
+  }
+  double avg_inter = 0.0;
+  for (auto l : inter_arrival_us) avg_inter += l;
+  avg_inter /= inter_arrival_us.empty() ? 1.0 : static_cast<double>(inter_arrival_us.size());
 
-  double p50 = latencies[latencies.size() / 2];
-  double p99 = latencies[latencies.size() * 99 / 100];
-  double p_max = latencies.back();
+  double p50 = inter_arrival_us.empty() ? 0.0 : inter_arrival_us[inter_arrival_us.size() / 2];
+  double p99 = inter_arrival_us.empty() ? 0.0 : inter_arrival_us[inter_arrival_us.size() * 99 / 100];
+  double p_max = inter_arrival_us.empty() ? 0.0 : inter_arrival_us.back();
 
   // --- IMU validation ---
   auto frame = reader.latest_frame();
@@ -154,12 +171,14 @@ auto main(int argc, char* argv[]) -> int {
 
   // TC5: Performance
   std::cout << "    \"tc5_performance\": {\n";
-  std::cout << "      \"avg_us\": " << std::fixed << std::setprecision(1) << avg << ",\n";
-  std::cout << "      \"p50_us\": " << p50 << ",\n";
-  std::cout << "      \"p99_us\": " << p99 << ",\n";
-  std::cout << "      \"max_us\": " << p_max << ",\n";
-  std::cout << "      \"fps\": " << std::fixed << std::setprecision(1) << fps << ",\n";
-  std::cout << "      \"total_frames\": " << latencies.size() << "\n";
+  std::cout << "      \"total_wall_ms\": " << total_wall_ms << ",\n";
+  std::cout << "      \"avg_inter_arrival_us\": " << std::fixed << std::setprecision(1) << avg_inter << ",\n";
+  std::cout << "      \"p50_inter_us\": " << p50 << ",\n";
+  std::cout << "      \"p99_inter_us\": " << p99 << ",\n";
+  std::cout << "      \"max_inter_us\": " << p_max << ",\n";
+  std::cout << "      \"throughput_fps\": " << std::fixed << std::setprecision(1)
+            << (total_wall_ms > 0 ? frame_count * 1000.0 / total_wall_ms : 0.0) << ",\n";
+  std::cout << "      \"video_fps\": " << std::fixed << std::setprecision(1) << fps << "\n";
   std::cout << "    }\n";
 
   std::cout << "  }\n";
@@ -175,8 +194,10 @@ auto main(int argc, char* argv[]) -> int {
     std::cout << "  \"height\": " << height << ",\n";
     std::cout << "  \"fps\": " << std::fixed << std::setprecision(1) << fps << ",\n";
     std::cout << "  \"imu_norm\": " << std::fixed << std::setprecision(6) << imu_norm << ",\n";
-    std::cout << "  \"latency_avg_us\": " << std::fixed << std::setprecision(1) << avg << ",\n";
-    std::cout << "  \"latency_p99_us\": " << std::fixed << std::setprecision(1) << p99 << "\n";
+    std::cout << "  \"latency_avg_inter_us\": " << std::fixed << std::setprecision(1) << avg_inter << ",\n";
+    std::cout << "  \"latency_p99_inter_us\": " << std::fixed << std::setprecision(1) << p99 << ",\n";
+    std::cout << "  \"throughput_fps\": " << std::fixed << std::setprecision(1)
+              << (total_wall_ms > 0 ? frame_count * 1000.0 / total_wall_ms : 0.0) << "\n";
     std::cout << "}\n";
     std::fclose(stdout);
     std::cout << "Baseline saved to " << baseline_path << "\n";
