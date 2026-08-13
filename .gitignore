@@ -1,0 +1,21 @@
+# Build output
+build/
+
+# Video files (large binary)
+*.mkv
+*.mp4
+*.avi
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# xmake
+.xmake/
