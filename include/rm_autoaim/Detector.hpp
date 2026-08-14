@@ -5,7 +5,7 @@
 #include <vector>
 
 #include <opencv2/core.hpp>
-
+#include <opencv2/videoio.hpp>
 namespace rm_autoaim {
 
 // ============================================================================
@@ -35,7 +35,9 @@ public:
   // Set detection parameters (useful for tuning)
   auto set_diff_threshold(int threshold) -> void;
   auto set_target_color(bool is_red) -> void;  // true = detect red, false = blue
-
+// Debug visualization: output annotated video
+  auto enable_debug_viz(const std::string& output_path) -> void;
+  auto disable_debug_viz() -> void;
 private:
   // ========================================================================
   // Sub-steps
@@ -84,9 +86,10 @@ private:
   struct ArmorPair {
     LightBar left;
     LightBar right;
+    double cost{0.0};
   };
 
-  [[nodiscard]] static auto pair_light_bars(
+[[nodiscard]] static auto pair_light_bars(
       const std::vector<LightBar>& candidates) -> std::vector<ArmorPair>;
 
   // Cost function: lower = better pairing
@@ -102,6 +105,11 @@ private:
   [[nodiscard]] static auto get_endpoints(const cv::RotatedRect& rect)
       -> std::pair<cv::Point2f, cv::Point2f>;
 
+// Debug visualization  ← 放这里，在 ArmorPair 定义之后
+  auto draw_debug_frame(const cv::Mat& bgr,
+                        const std::vector<LightBar>& light_bars,
+                        const std::vector<ArmorPair>& pairs) -> void;
+
   // Parameters
   int diff_threshold_{80};
   bool detect_red_{true};  // default: detect red armor (enemy)
@@ -109,6 +117,11 @@ private:
   // Temporal feedback for adaptive morphology (Step 2)
   // Updated every frame from the average height of filtered light bars.
   float prev_avg_lightbar_height_{80.0F};  // conservative init: default 5×5 kernel
+ float prev_avg_armor_long_edge_{0.0F}; 
+// Debug members
+  cv::VideoWriter debug_writer_;
+  std::string debug_viz_path_;
+  bool debug_viz_enabled_{false};
 };
 
 }  // namespace rm_autoaim
