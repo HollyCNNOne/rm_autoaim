@@ -6,7 +6,6 @@
 #include <limits>
 
 #include <opencv2/calib3d.hpp>
-#include <spdlog/spdlog.h>
 
 namespace rm_autoaim {
 
@@ -17,7 +16,11 @@ namespace rm_autoaim {
 Tracker::Tracker()
     : camera_matrix_(make_camera_matrix())
     , dist_coeffs_(make_dist_coeffs())
-    , model_points_(make_armor_model_points()) {}
+    , model_points_(make_armor_model_points()) {
+  for (int i = 0; i < kMaxSlots; ++i) {
+    free_slots_.push(i);
+  }
+}
 
 // ============================================================================
 // Public API
@@ -25,41 +28,110 @@ Tracker::Tracker()
 
 auto Tracker::update(const std::vector<Armor2D>& detections)
     -> std::vector<TrackedArmor> {
-  // Associate detections with existing tracks
+  // ============================================================
+  // Phase 1: Countdown — decrement lease for all active slots
+  // ============================================================
+  for (int i = 0; i < kMaxSlots; ++i) {
+    if (slot_active_[i]) {
+      slot_timeout_[i]--;
+      if (slot_timeout_[i] <= 0) {
+        slot_active_[i] = false;
+        free_slots_.push(i);
+      }
+    }
+  }
+
+  // ============================================================
+  // Phase 2: Build active slot list for Hungarian input
+  // ============================================================
+  std::vector<TrackedArmor> active_tracks;
+  std::vector<int> active_to_slot;
+  for (int i = 0; i < kMaxSlots; ++i) {
+    if (slot_active_[i]) {
+      active_tracks.push_back(slots_[i]);
+      active_to_slot.push_back(i);
+    }
+  }
+
+  // ============================================================
+  // Phase 3: Hungarian matching (pure IoU)
+  // ============================================================
   auto [matches, unmatched_det, unmatched_trk] =
-      associate(detections, tracks_);
+      associate(detections, active_tracks);
 
-  // Update lifecycle
-  update_tracks(detections, matches, unmatched_det, unmatched_trk);
+  // ============================================================
+  // Phase 4: Execute matches — renew lease, update PnP
+  // ============================================================
+  for (const auto& [det_idx, trk_idx] : matches) {
+    int slot_idx = active_to_slot[trk_idx];
+    auto& slot = slots_[slot_idx];
+    slot.detection = detections[det_idx];
+    slot.pose = solve_pnp(detections[det_idx]);
+    slot.status = TrackedArmor::Status::kConfirmed;
+    slot_timeout_[slot_idx] = kTimeoutFrames;
+  }
 
-  // Return all confirmed tracks
+  // ============================================================
+  // Phase 5: New detections → assign free slots from queue
+  // ============================================================
+  for (int det_idx : unmatched_det) {
+    if (free_slots_.empty()) {
+      continue;
+    }
+    int new_slot = free_slots_.front();
+    free_slots_.pop();
+
+    auto& slot = slots_[new_slot];
+    slot.id = new_slot;
+    slot.detection = detections[det_idx];
+    slot.pose = solve_pnp(detections[det_idx]);
+    slot.status = TrackedArmor::Status::kConfirmed;
+    slot_active_[new_slot] = true;
+    slot_timeout_[new_slot] = kTimeoutFrames;
+  }
+
+  // ============================================================
+  // Phase 6: Unmatched tracks → Phase 1 countdown handles timeout
+  // ============================================================
+
+  // Return all active slots
   std::vector<TrackedArmor> active;
-  for (auto& t : tracks_) {
-    if (t.status == TrackedArmor::Status::kConfirmed ||
-        t.status == TrackedArmor::Status::kLost) {
-      active.push_back(t);
+  for (int i = 0; i < kMaxSlots; ++i) {
+    if (slot_active_[i]) {
+      active.push_back(slots_[i]);
     }
   }
   return active;
 }
 
-auto Tracker::tracks() const -> const std::vector<TrackedArmor>& {
-  return tracks_;
+auto Tracker::tracks() const -> std::vector<TrackedArmor> {
+  std::vector<TrackedArmor> result;
+  for (int i = 0; i < kMaxSlots; ++i) {
+    if (slot_active_[i]) {
+      result.push_back(slots_[i]);
+    }
+  }
+  return result;
 }
 
 auto Tracker::reset() -> void {
-  tracks_.clear();
-  next_track_id_ = 0;
+  for (int i = 0; i < kMaxSlots; ++i) {
+    slot_active_[i] = false;
+    slot_timeout_[i] = 0;
+  }
+  free_slots_ = std::queue<int>();
+  for (int i = 0; i < kMaxSlots; ++i) {
+    free_slots_.push(i);
+  }
 }
 
 // ============================================================================
-// PnP Pose Estimation
+// PnP Pose Estimation (UNCHANGED)
 // ============================================================================
 
 auto Tracker::solve_pnp(const Armor2D& detection) -> ArmorPose {
   ArmorPose pose;
 
-  // Convert 2D corners to vector<Point2f>
   std::vector<cv::Point2f> image_points(detection.corners.begin(),
                                         detection.corners.end());
 
@@ -70,16 +142,13 @@ auto Tracker::solve_pnp(const Armor2D& detection) -> ArmorPose {
                               cv::SOLVEPNP_IPPE);
 
   if (!success) {
-    // Fallback: try EPnP
     cv::solvePnP(model_points_, image_points, camera_matrix_, dist_coeffs_,
                  rvec, tvec, false, cv::SOLVEPNP_EPNP);
   }
 
-  // Convert rotation vector to matrix
   cv::Mat rot_mat;
   cv::Rodrigues(rvec, rot_mat);
 
-  // Copy to Eigen
   pose.translation =
       Eigen::Vector3d(tvec.at<double>(0), tvec.at<double>(1), tvec.at<double>(2));
 
@@ -91,7 +160,6 @@ auto Tracker::solve_pnp(const Armor2D& detection) -> ArmorPose {
 
   pose.depth = pose.translation.z();
 
-  // Convert to Eigen quaternion
   Eigen::Quaterniond q(pose.rotation);
   pose.quaternion = q;
 
@@ -99,7 +167,7 @@ auto Tracker::solve_pnp(const Armor2D& detection) -> ArmorPose {
 }
 
 // ============================================================================
-// Data Association (Hungarian Algorithm)
+// Data Association — Hungarian Algorithm (UNCHANGED)
 // ============================================================================
 
 auto Tracker::associate(
@@ -168,72 +236,10 @@ auto Tracker::associate(
 }
 
 // ============================================================================
-// Lifecycle Management
-// ============================================================================
-
-auto Tracker::update_tracks(
-    const std::vector<Armor2D>& detections,
-    const std::vector<std::pair<int, int>>& matches,
-    const std::vector<int>& unmatched_det,
-    const std::vector<int>& unmatched_trk) -> void {
-  // Update matched tracks
-  for (const auto& [det_idx, trk_idx] : matches) {
-    auto& track = tracks_[trk_idx];
-    track.detection = detections[det_idx];
-    track.pose = solve_pnp(detections[det_idx]);
-    track.consecutive_detections++;
-    track.consecutive_misses = 0;
-    track.age++;
-
-    if (track.consecutive_detections >= constants::kConfirmThreshold) {
-      track.status = TrackedArmor::Status::kConfirmed;
-    }
-  }
-
-  // Create new tracks for unmatched detections
-  for (int det_idx : unmatched_det) {
-    TrackedArmor new_track;
-    new_track.id = next_track_id_++;
-    new_track.detection = detections[det_idx];
-    new_track.pose = solve_pnp(detections[det_idx]);
-    new_track.status = TrackedArmor::Status::kTentative;
-    new_track.consecutive_detections = 1;
-    new_track.consecutive_misses = 0;
-    new_track.age = 0;
-    tracks_.push_back(new_track);
-  }
-
-  // Update unmatched tracks (lost)
-  for (int trk_idx : unmatched_trk) {
-    auto& track = tracks_[trk_idx];
-    track.consecutive_misses++;
-    track.consecutive_detections = 0;
-    track.age++;
-
-    if (track.status == TrackedArmor::Status::kTentative) {
-      track.status = TrackedArmor::Status::kDead;
-    } else if (track.consecutive_misses >= constants::kLostThreshold) {
-      track.status = TrackedArmor::Status::kDead;
-    } else {
-      track.status = TrackedArmor::Status::kLost;
-    }
-  }
-
-  // Remove dead tracks
-  tracks_.erase(
-      std::remove_if(tracks_.begin(), tracks_.end(),
-                     [](const TrackedArmor& t) {
-                       return t.status == TrackedArmor::Status::kDead;
-                     }),
-      tracks_.end());
-}
-
-// ============================================================================
-// IoU Computation
+// IoU Computation (UNCHANGED)
 // ============================================================================
 
 auto Tracker::compute_iou(const Armor2D& a, const Armor2D& b) -> double {
-  // Compute axis-aligned bounding boxes from corners
   auto get_bbox = [](const Armor2D& armor) -> cv::Rect2f {
     float x_min = std::numeric_limits<float>::max();
     float y_min = std::numeric_limits<float>::max();
@@ -253,7 +259,6 @@ auto Tracker::compute_iou(const Armor2D& a, const Armor2D& b) -> double {
   auto box_a = get_bbox(a);
   auto box_b = get_bbox(b);
 
-  // Intersection
   float x_inter = std::max(0.0F,
       std::min(box_a.x + box_a.width, box_b.x + box_b.width) -
       std::max(box_a.x, box_b.x));
