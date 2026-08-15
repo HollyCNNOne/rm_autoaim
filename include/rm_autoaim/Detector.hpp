@@ -5,7 +5,6 @@
 #include <vector>
 
 #include <opencv2/core.hpp>
-#include <opencv2/videoio.hpp>
 namespace rm_autoaim {
 
 // ============================================================================
@@ -13,7 +12,7 @@ namespace rm_autoaim {
 //
 // Detects outpost armor plates from a single BGR image frame.
 //
-// Optimized Pipeline (v2.1):
+// Optimized Pipeline (v2.2):
 //   1. CLAHE-enhanced HSV thresholding with dynamic V lower-bound
 //   2. Distance-adaptive morphological operations (temporal feedback)
 //   3. Contour extraction
@@ -35,9 +34,6 @@ public:
   // Set detection parameters (useful for tuning)
   auto set_diff_threshold(int threshold) -> void;
   auto set_target_color(bool is_red) -> void;  // true = detect red, false = blue
-// Debug visualization: output annotated video
-  auto enable_debug_viz(const std::string& output_path) -> void;
-  auto disable_debug_viz() -> void;
 private:
   // ========================================================================
   // Sub-steps
@@ -93,7 +89,7 @@ private:
       const std::vector<LightBar>& candidates) -> std::vector<ArmorPair>;
 
   // Cost function: lower = better pairing
-  // Weights: height(0.35) + angle(0.25) + y-offset(0.20) + x-ratio(0.20)
+  // Weights: height(0.45) + angle(0.25) + y-offset(0.10) + x-ratio(0.20)
   [[nodiscard]] static auto compute_pair_cost(const LightBar& a,
                                               const LightBar& b) -> double;
 
@@ -105,23 +101,14 @@ private:
   [[nodiscard]] static auto get_endpoints(const cv::RotatedRect& rect)
       -> std::pair<cv::Point2f, cv::Point2f>;
 
-// Debug visualization  ← 放这里，在 ArmorPair 定义之后
-  auto draw_debug_frame(const cv::Mat& bgr,
-                        const std::vector<LightBar>& light_bars,
-                        const std::vector<ArmorPair>& pairs) -> void;
-
-  // Parameters
+// Parameters
   int diff_threshold_{80};
   bool detect_red_{true};  // default: detect red armor (enemy)
 
   // Temporal feedback for adaptive morphology (Step 2)
   // Updated every frame from the average height of filtered light bars.
   float prev_avg_lightbar_height_{80.0F};  // conservative init: default 5×5 kernel
- float prev_avg_armor_long_edge_{0.0F}; 
-// Debug members
-  cv::VideoWriter debug_writer_;
-  std::string debug_viz_path_;
-  bool debug_viz_enabled_{false};
+  float prev_avg_armor_long_edge_{0.0F};
 };
 
 }  // namespace rm_autoaim
