@@ -167,7 +167,7 @@ auto Tracker::solve_pnp(const Armor2D& detection) -> ArmorPose {
 }
 
 // ============================================================================
-// Data Association — Hungarian Algorithm (mixed cost: 60% IoU + 40% center distance)
+// Data Association — Hungarian Algorithm (UNCHANGED)
 // ============================================================================
 
 auto Tracker::associate(
@@ -196,36 +196,12 @@ auto Tracker::associate(
     return {matches, unmatched_det, unmatched_trk};
   }
 
-  // Pre-compute detection centers
-  std::vector<cv::Point2f> det_centers(n_det);
-  for (int i = 0; i < n_det; ++i) {
-    const auto& c = detections[i].corners;
-    det_centers[i] = {(c[0].x + c[1].x + c[2].x + c[3].x) / 4.0F,
-                      (c[0].y + c[1].y + c[2].y + c[3].y) / 4.0F};
-  }
-
-  // Pre-compute track centers
-  std::vector<cv::Point2f> trk_centers(n_trk);
-  for (int j = 0; j < n_trk; ++j) {
-    const auto& c = tracks[j].detection.corners;
-    trk_centers[j] = {(c[0].x + c[1].x + c[2].x + c[3].x) / 4.0F,
-                      (c[0].y + c[1].y + c[2].y + c[3].y) / 4.0F};
-  }
-
-  // Build mixed cost matrix: 60% IoU + 40% center distance
-  // Center distance helps maintain track identity during rotation
-  // when IoU drops due to armor plate aspect ratio change
+  // Build cost matrix: cost = 1 - IoU
   internal::Hungarian::CostMatrix cost(n_det, n_trk);
-  constexpr double kMaxCenterDist{150.0};
   for (int i = 0; i < n_det; ++i) {
     for (int j = 0; j < n_trk; ++j) {
       double iou = compute_iou(detections[i], tracks[j].detection);
-      double iou_cost = 1.0 - iou;
-      double dx = static_cast<double>(det_centers[i].x - trk_centers[j].x);
-      double dy = static_cast<double>(det_centers[i].y - trk_centers[j].y);
-      double center_dist = std::sqrt(dx * dx + dy * dy);
-      double center_cost = std::min(center_dist / kMaxCenterDist, 1.0);
-      cost(i, j) = 0.6 * iou_cost + 0.4 * center_cost;
+      cost(i, j) = 1.0 - iou;
     }
   }
 

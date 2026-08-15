@@ -35,7 +35,7 @@ private:
   [[nodiscard]] auto solve_pnp(const Armor2D& detection)
       -> ArmorPose;
 
-  // Data association: Hungarian (mixed cost: 60% IoU + 40% center distance)
+  // Data association: Hungarian (UNCHANGED, pure IoU)
   [[nodiscard]] auto associate(
       const std::vector<Armor2D>& detections,
       const std::vector<TrackedArmor>& tracks)
