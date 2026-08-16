@@ -51,9 +51,11 @@ struct Armor2D {
 
 struct ArmorPose {
   Eigen::Vector3d translation;  // [tx, ty, tz] in camera frame
-  Eigen::Matrix3d rotation;     // 3x3 rotation matrix
+  Eigen::Matrix3d rotation;     // 3x3 rotation matrix (Rz·Ry·Rx convention)
   Eigen::Quaterniond quaternion;
-  double depth{0.0};  // tz for convenience
+  double depth{0.0};   // tz for convenience
+  double pitch{0.0};   // rad, extracted from rotation matrix
+  double yaw{0.0};     // rad, extracted from rotation matrix
 };
 
 // ============================================================================
@@ -175,7 +177,7 @@ inline constexpr double kK3{0.0};
 // Tracker parameters
 inline constexpr int kConfirmThreshold{3};    // frames to confirm
 inline constexpr int kLostThreshold{5};        // frames before removal
-inline constexpr double kIoUMin{0.3};          // minimum IoU for match
+inline constexpr double kIoUMin{0.45};          // minimum IoU for match
 
 // Detector parameters
 // Relaxed for outpost scenario: small armor plates at a distance
