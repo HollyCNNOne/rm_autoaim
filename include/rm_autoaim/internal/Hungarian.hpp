@@ -1,9 +1,9 @@
 #pragma once
 
-#include <Eigen/Dense>
-
 #include <limits>
 #include <vector>
+
+#include <Eigen/Dense>
 
 namespace rm_autoaim::internal {
 

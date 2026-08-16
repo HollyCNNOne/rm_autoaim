@@ -2,6 +2,7 @@
 
 #include "rm_autoaim/Types.hpp"
 
+#include <array>
 #include <vector>
 
 namespace rm_autoaim {
@@ -58,6 +59,22 @@ private:
   [[nodiscard]] auto integrate_drag(double pitch, double yaw, double v0,
                                     double t_max, double dt_step) const
       -> BulletState;
+
+  // V5: per-target last valid state for rate-of-change guard
+  struct LastValid {
+    double depth{0.0};
+    AimAngle aim;
+    bool valid{false};
+  };
+  static constexpr int kMaxTargets{3};
+  static constexpr double kDepthMin{0.5};
+  static constexpr double kDepthMax{15.0};
+  static constexpr double kTflyMin{0.05};   // 50ms
+  static constexpr double kTflyMax{0.6};    // 600ms
+  static constexpr double kPitchMin{-25.0 * M_PI / 180.0};
+  static constexpr double kPitchMax{+25.0 * M_PI / 180.0};
+  static constexpr double kDepthChangeMax{0.40};  // 40% rate-of-change limit
+  std::array<LastValid, kMaxTargets> last_valid_{};
 
   double bullet_speed_{15.0};  // m/s
   bool use_air_resistance_{false};

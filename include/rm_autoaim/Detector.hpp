@@ -5,55 +5,17 @@
 #include <vector>
 
 #include <opencv2/core.hpp>
+
 namespace rm_autoaim {
 
-// ============================================================================
-// Detector — Module 2: Armor Plate Detection
-//
-// Detects outpost armor plates from a single BGR image frame.
-//
-// Optimized Pipeline (v2.2):
-//   1. CLAHE-enhanced HSV thresholding with dynamic V lower-bound
-//   2. Distance-adaptive morphological operations (temporal feedback)
-//   3. Contour extraction
-//   4. Relaxed light bar filtering → feature encoder (passes more
-//      candidates to Step 5 with per-bar feature vectors)
-//   5. Soft-scoring + sliding-window pruning + greedy conflict resolution
-//   6. Corner extraction (4 armor corners)
-// ============================================================================
-
+// Outpost armor plate detection — 6-step pipeline with soft-scoring pairing
 class Detector {
 public:
   Detector() = default;
 
-  // Detect armor plates in a single frame
-  // Returns list of detected armors (4 corners each)
   [[nodiscard]] auto detect(const cv::Mat& bgr_image)
       -> std::vector<Armor2D>;
 
-  // Set detection parameters (useful for tuning)
-  auto set_diff_threshold(int threshold) -> void;
-  auto set_target_color(bool is_red) -> void;  // true = detect red, false = blue
-private:
-  // ========================================================================
-  // Sub-steps
-  // ========================================================================
-
-  // Step 1: CLAHE-enhanced color separation with dynamic V threshold
-  [[nodiscard]] auto extract_color(const cv::Mat& bgr) const -> cv::Mat;
-
-  // Step 2: Distance-adaptive morphological operations
-  // Uses prev_avg_lightbar_height_ to adapt the closing kernel size:
-  //   near (h > 100px) → 9×9;  mid (h > 50px) → 7×7;  far (h < 20px) → 3×3
-  [[nodiscard]] auto apply_morphology(const cv::Mat& binary) -> cv::Mat;
-
-  // Step 3: Contour extraction
-  [[nodiscard]] static auto extract_contours(const cv::Mat& binary)
-      -> std::vector<std::vector<cv::Point>>;
-
-  // Step 4: Relaxed light bar filtering → feature encoder
-  // Thresholds widened ~20% vs. original; passes "suspicious" candidates
-  // to Step 5 so the cost function can make the final decision.
   struct LightBar {
     cv::RotatedRect rect;
     cv::Point2f center;
@@ -64,50 +26,58 @@ private:
     float convexity{0.0F};
   };
 
-  [[nodiscard]] static auto filter_light_bars(
-      const std::vector<std::vector<cv::Point>>& contours)
-      -> std::vector<LightBar>;
-
-  // Step 5: Soft-scoring + sliding-window + greedy conflict resolution
-  //
-  // Replaces hard if-thresholds with a continuous cost function:
-  //   Score = w1·f(Height) + w2·f(Angle) + w3·f(Y_offset) + w4·f(X_ratio)
-  //
-  // Algorithm:
-  //   A. Sort candidates by center.x
-  //   B. Sliding window: for each i, examine j in [i+1, i+max_search_range),
-  //      break early when x-distance exceeds max_allowed_distance
-  //   C. Sort all scored pairs by cost (ascending)
-  //   D. Greedy assignment with conflict resolution (used[] flag array)
   struct ArmorPair {
     LightBar left;
     LightBar right;
     double cost{0.0};
   };
 
-[[nodiscard]] static auto pair_light_bars(
-      const std::vector<LightBar>& candidates) -> std::vector<ArmorPair>;
+  struct DetectorDebugInfo {
+    std::vector<LightBar> light_bars;
+    std::vector<ArmorPair> pairs;
+  };
 
-  // Cost function: lower = better pairing
-  // Weights: height(0.45) + angle(0.25) + y-offset(0.10) + x-ratio(0.20)
-  [[nodiscard]] static auto compute_pair_cost(const LightBar& a,
-                                              const LightBar& b) -> double;
+  [[nodiscard]] auto detect_debug(const cv::Mat& bgr_image)
+      -> std::pair<std::vector<Armor2D>, DetectorDebugInfo>;
 
-  // Step 6: Extract 4 corners from paired light bars
+  auto set_diff_threshold(int threshold) -> void;
+  auto set_target_color(bool is_red) -> void;
+
   [[nodiscard]] static auto extract_corners(const ArmorPair& pair)
       -> std::array<cv::Point2f, 4>;
 
-  // Helper: get light bar endpoints (top-center, bottom-center)
+private:
+  [[nodiscard]] auto extract_color(const cv::Mat& bgr) const -> cv::Mat;
+
+  // Adapts closing kernel to distance: near(9×9) → mid(7×7) → far(3×3)
+  [[nodiscard]] auto apply_morphology(const cv::Mat& binary) -> cv::Mat;
+
+  [[nodiscard]] static auto extract_contours(const cv::Mat& binary)
+      -> std::vector<std::vector<cv::Point>>;
+
+  // Thresholds widened ~20% vs. original; passes suspicious candidates
+  // to Step 5 so the cost function makes the final decision
+  [[nodiscard]] static auto filter_light_bars(
+      const std::vector<std::vector<cv::Point>>& contours)
+      -> std::vector<LightBar>;
+
+  // Soft-scoring replaces hard thresholds: cost = w1·f(Height) + w2·f(Angle)
+  //   + w3·f(Y_offset) + w4·f(X_ratio)
+  // Sliding-window + greedy conflict resolution prevents cross-panel pairing
+  [[nodiscard]] static auto pair_light_bars(
+      const std::vector<LightBar>& candidates) -> std::vector<ArmorPair>;
+
+  // Weights: height(0.35) + angle(0.25) + y-offset(0.20) + x-ratio(0.20)
+  [[nodiscard]] static auto compute_pair_cost(const LightBar& a,
+                                              const LightBar& b) -> double;
+
   [[nodiscard]] static auto get_endpoints(const cv::RotatedRect& rect)
       -> std::pair<cv::Point2f, cv::Point2f>;
 
-// Parameters
   int diff_threshold_{80};
-  bool detect_red_{true};  // default: detect red armor (enemy)
+  bool detect_red_{true};
 
-  // Temporal feedback for adaptive morphology (Step 2)
-  // Updated every frame from the average height of filtered light bars.
-  float prev_avg_lightbar_height_{80.0F};  // conservative init: default 5×5 kernel
+  float prev_avg_lightbar_height_{80.0F};
   float prev_avg_armor_long_edge_{0.0F};
 };
 

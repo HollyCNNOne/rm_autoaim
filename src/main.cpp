@@ -1,9 +1,9 @@
-#include "rm_autoaim/Pipeline.hpp"
-
 #include <csignal>
 #include <cstdlib>
 #include <iostream>
 #include <thread>
+
+#include "rm_autoaim/Pipeline.hpp"
 
 #include <spdlog/spdlog.h>
 
@@ -22,12 +22,14 @@ auto signal_handler(int /*sig*/) -> void {
 }
 
 auto print_usage(const char* prog) -> void {
-  std::cout << "Usage: " << prog << " <video_path>\n"
+  std::cout << "Usage: " << prog << " <video_path> [--debug-viz <output.avi>]\n"
             << "  video_path: path to outpost.mkv (or armor.mkv, energy.mkv)\n"
+            << "  --debug-viz: enable annotated debug video output\n"
             << "\n"
             << "Example:\n"
             << "  " << prog << " outpost.mkv\n"
-            << "  " << prog << " /path/to/27赛季视觉组特招考核试题/图片和附件/outpost.mkv\n";
+            << "  " << prog << " outpost.mkv --debug-viz debug_output.avi\n"
+            << "  " << prog << " /path/to/视频/outpost.mkv\n";
 }
 
 }  // namespace
@@ -44,6 +46,15 @@ auto main(int argc, char* argv[]) -> int {
   }
 
   std::string video_path = argv[1];
+  std::string debug_viz_path;
+
+  // Parse optional --debug-viz argument
+  for (int i = 2; i < argc; ++i) {
+    std::string arg = argv[i];
+    if (arg == "--debug-viz" && i + 1 < argc) {
+      debug_viz_path = argv[++i];
+    }
+  }
 
   spdlog::info("============================================");
   spdlog::info(" RoboMaster Autoaim System — Scenario C: Outpost");
@@ -57,6 +68,12 @@ auto main(int argc, char* argv[]) -> int {
   // Create and start pipeline
   rm_autoaim::Pipeline pipeline(video_path);
   g_pipeline = &pipeline;
+
+  // Enable debug visualization if requested
+  if (!debug_viz_path.empty()) {
+    pipeline.enable_debug_viz(debug_viz_path);
+    spdlog::info(" Debug viz output: {}", debug_viz_path);
+  }
 
   pipeline.start();
 

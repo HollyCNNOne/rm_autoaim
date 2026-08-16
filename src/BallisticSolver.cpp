@@ -49,16 +49,28 @@ auto BallisticSolver::solve_single(const PredictedState& target,
   AimAngle result;
   result.target_id = target.target_id;
 
-  // Sanity check: reject implausible depth (PnP may fail on bad pairings)
-  // Outpost is expected at 3–30 m; reject anything outside [0.5, 50]
+  // V5 Firewall 1: Tightened hard depth bounds (0.5–15m, was 0.5–50m)
   double depth = target.position.z();
-  if (depth < 0.5 || depth > 50.0 || !std::isfinite(depth)) {
+  if (depth < kDepthMin || depth > kDepthMax || !std::isfinite(depth)) {
     return result;
   }
   double horizontal_dist_cam = std::sqrt(target.position.x() * target.position.x()
                                          + target.position.y() * target.position.y());
-  if (horizontal_dist_cam < 1e-6 || horizontal_dist_cam > 50.0) {
+  if (horizontal_dist_cam < 1e-6 || horizontal_dist_cam > kDepthMax) {
     return result;
+  }
+
+  // V5 Firewall 2: Rate-of-change limiter (40% max depth change per frame)
+  // Prevents t_fly=776ms spikes from polluting the output
+  int tid = target.target_id;
+  if (tid >= 0 && tid < kMaxTargets && last_valid_[tid].valid) {
+    double delta = std::abs(depth - last_valid_[tid].depth);
+    double ratio = delta / last_valid_[tid].depth;
+    if (ratio > kDepthChangeMax) {
+      spdlog::warn("[V5] Depth spike rejected: {:.2f}m → {:.2f}m (Δ={:.0f}%)",
+                   last_valid_[tid].depth, depth, ratio * 100.0);
+      return last_valid_[tid].aim;  // reuse last valid aim
+    }
   }
 
   // Transform target position from camera frame to world frame (Z-up)
@@ -77,7 +89,6 @@ auto BallisticSolver::solve_single(const PredictedState& target,
   double dx = world_pos.x();
   double dy = world_pos.y();
   double dz = world_pos.z();
-
   // Initial flight time estimate (no motion compensation)
   double horizontal_dist = std::sqrt(dx * dx + dy * dy);
   if (horizontal_dist < 1e-6) {
@@ -106,7 +117,6 @@ auto BallisticSolver::solve_single(const PredictedState& target,
     dx = aim_world.x();
     dy = aim_world.y();
     dz = aim_world.z();
-
     horizontal_dist = std::sqrt(dx * dx + dy * dy);
 
     // Solve pitch (and new flight time)
@@ -122,9 +132,26 @@ auto BallisticSolver::solve_single(const PredictedState& target,
   // Compute yaw
   yaw = std::atan2(dy, dx);
 
+  // V5 Firewall 3: Output sanity — clamp t_fly and validate pitch
+  t_fly = std::clamp(t_fly, kTflyMin, kTflyMax);
+  if (pitch < kPitchMin || pitch > kPitchMax) {
+    // pitch out of physical range, reuse last valid if available
+    if (tid >= 0 && tid < kMaxTargets && last_valid_[tid].valid) {
+      return last_valid_[tid].aim;
+    }
+    return result;
+  }
+
   result.pitch = pitch;
   result.yaw = yaw;
   result.flight_time = t_fly;
+
+  // Store last valid state for rate-of-change guard next frame
+  if (tid >= 0 && tid < kMaxTargets) {
+    last_valid_[tid].depth = depth;
+    last_valid_[tid].aim = result;
+    last_valid_[tid].valid = true;
+  }
 
   return result;
 }

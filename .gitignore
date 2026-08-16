@@ -1,27 +1,25 @@
-# Build output
+# Build artifacts
 build/
+.xmake/
 
-# Video files (large binary)
+# Test videos (large, excluded from repo)
 *.mkv
 *.mp4
 *.avi
 
-# IDE
+# Debug outputs
+debug_*.png
+debug_*.avi
+*.log
+logs/
+
+# IDE / OS
 .vscode/
 .idea/
 *.swp
-*.swo
-*~
-
-# OS
 .DS_Store
-Thumbs.db
 
-# xmake
-.xmake/
-
-# Backup files
-*.bak
-
-# Auto-generated docs
-README.md
+# Archives
+*.rar
+*.zip
+*.tar.gz

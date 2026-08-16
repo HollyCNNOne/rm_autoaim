@@ -11,6 +11,7 @@
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <vector>
 
 #include <opencv2/core.hpp>
 #include <opencv2/imgcodecs.hpp>
@@ -43,7 +44,7 @@ auto json_escape(const std::string& s) -> std::string {
   return out;
 }
 
-} // anonymous namespace
+}  // anonymous namespace
 
 auto main(int argc, char* argv[]) -> int {
   if (argc < 2) {
@@ -160,9 +161,6 @@ auto main(int argc, char* argv[]) -> int {
             << (throughput_fps / fps) << ",\n";
   std::cout << "      \"total_frames\": " << frame_count << "\n";
   std::cout << "    }\n";
-
-  std::cout << "  }\n";
-  std::cout << "}\n";
 
   // --- Save baseline if requested ---
   if (!baseline_path.empty()) {

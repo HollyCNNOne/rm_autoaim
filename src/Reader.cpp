@@ -350,7 +350,7 @@ auto b64_decode(const std::string& input) -> std::vector<uint8_t> {
   }
   return output;
 }
-} // anonymous namespace
+}  // anonymous namespace
 
 auto Reader::decode_base64_to_quaternion(const std::string& b64)
     -> Quaternion {
@@ -379,7 +379,7 @@ auto Reader::decode_base64_to_quaternion(const std::string& b64)
 auto Quaternion::to_rotation_matrix() const -> Eigen::Matrix3d {
   Eigen::Matrix3d R;
 
-  double /*w2 = w * w,*/ x2 = x * x, y2 = y * y, z2 = z * z;
+  double x2 = x * x, y2 = y * y, z2 = z * z;
   double wx = w * x, wy = w * y, wz = w * z;
   double xy = x * y, xz = x * z, yz = y * z;
 

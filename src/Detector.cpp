@@ -7,9 +7,7 @@
 
 namespace rm_autoaim {
 
-// ============================================================================
-// Relaxed thresholds for Step 4 (wider than Types.hpp constants)
-// ============================================================================
+// Relaxed thresholds for Step 4 (~5% wider than Types.hpp constants)
 namespace {
 inline constexpr double kRelaxedMinAspectRatio{0.04};
 inline constexpr double kRelaxedMaxAspectRatio{0.60};
@@ -18,10 +16,6 @@ inline constexpr double kRelaxedMaxArea{9600.0};
 inline constexpr double kRelaxedMinConvexity{0.50};
 }  // anonymous namespace
 
-// ============================================================================
-// Public API
-// ============================================================================
-
 auto Detector::detect(const cv::Mat& bgr_image) -> std::vector<Armor2D> {
   std::vector<Armor2D> results;
 
@@ -29,22 +23,17 @@ auto Detector::detect(const cv::Mat& bgr_image) -> std::vector<Armor2D> {
     return results;
   }
 
-  // Step 1: ROI first, then CLAHE-enhanced color separation
   auto roi_h = bgr_image.rows / 2;
   cv::Rect roi_rect(0, 0, bgr_image.cols, roi_h);
   cv::Mat bgr_roi = bgr_image(roi_rect);
   cv::Mat diff = extract_color(bgr_roi);
 
-  // Step 2: Distance-adaptive morphology
   cv::Mat clean = apply_morphology(diff);
 
-  // Step 3: Contour extraction
   auto contours = extract_contours(clean);
 
-  // Step 4: Relaxed light bar filtering
   auto light_bars = filter_light_bars(contours);
 
-  // Update adaptive state for next frame's morphology
   if (!light_bars.empty()) {
     auto sum_h = 0.0F;
     for (const auto& lb : light_bars) {
@@ -53,16 +42,15 @@ auto Detector::detect(const cv::Mat& bgr_image) -> std::vector<Armor2D> {
     prev_avg_lightbar_height_ = sum_h / static_cast<float>(light_bars.size());
   }
 
-  // Step 5: Soft-scoring + sliding-window + greedy conflict resolution
   auto pairs = pair_light_bars(light_bars);
 
-  // Step 6: Corner extraction with temporal long-edge validation
+  // Temporal long-edge validation: reject sudden size jumps caused by
+  // cross-panel mis-pairing (yellow stripes etc.)
   constexpr float kEmaAlpha{0.15F};
 
   for (const auto& pair : pairs) {
     auto corners = extract_corners(pair);
 
-    // Hard reject abnormal aspect ratio
     auto v1 = corners[1] - corners[0];
     auto v2 = corners[3] - corners[0];
     auto w = static_cast<float>(cv::norm(v1));
@@ -93,6 +81,76 @@ auto Detector::detect(const cv::Mat& bgr_image) -> std::vector<Armor2D> {
   }
 
   return results;
+}
+
+auto Detector::detect_debug(const cv::Mat& bgr_image)
+    -> std::pair<std::vector<Armor2D>, DetectorDebugInfo> {
+  std::vector<Armor2D> results;
+  DetectorDebugInfo debug;
+
+  if (bgr_image.empty()) {
+    return {results, debug};
+  }
+
+  auto roi_h = bgr_image.rows / 2;
+  cv::Rect roi_rect(0, 0, bgr_image.cols, roi_h);
+  cv::Mat bgr_roi = bgr_image(roi_rect);
+  cv::Mat diff = extract_color(bgr_roi);
+
+  cv::Mat clean = apply_morphology(diff);
+
+  auto contours = extract_contours(clean);
+
+  auto light_bars = filter_light_bars(contours);
+
+  if (!light_bars.empty()) {
+    auto sum_h = 0.0F;
+    for (const auto& lb : light_bars) {
+      sum_h += lb.height;
+    }
+    prev_avg_lightbar_height_ = sum_h / static_cast<float>(light_bars.size());
+  }
+
+  auto pairs = pair_light_bars(light_bars);
+
+  constexpr float kEmaAlpha{0.15F};
+
+  for (const auto& pair : pairs) {
+    auto corners = extract_corners(pair);
+
+    auto v1 = corners[1] - corners[0];
+    auto v2 = corners[3] - corners[0];
+    auto w = static_cast<float>(cv::norm(v1));
+    auto h = static_cast<float>(cv::norm(v2));
+    auto aspect = (h > 1e-4F) ? (w / h) : 0.0F;
+    if (aspect < 1.2F || aspect > 4.5F) continue;
+
+    auto top_edge = static_cast<float>(cv::norm(corners[1] - corners[0]));
+    auto bot_edge = static_cast<float>(cv::norm(corners[2] - corners[3]));
+    auto long_edge = std::max(top_edge, bot_edge);
+
+    if (prev_avg_armor_long_edge_ > 1e-4F) {
+      auto ratio = long_edge / prev_avg_armor_long_edge_;
+      if (ratio > 1.5F) continue;
+    }
+
+    if (prev_avg_armor_long_edge_ < 1e-4F) {
+      prev_avg_armor_long_edge_ = long_edge;
+    } else {
+      prev_avg_armor_long_edge_ = kEmaAlpha * long_edge
+        + (1.0F - kEmaAlpha) * prev_avg_armor_long_edge_;
+    }
+
+    Armor2D armor;
+    armor.corners = corners;
+    armor.confidence = 1.0F;
+    results.push_back(armor);
+  }
+
+  debug.light_bars = std::move(light_bars);
+  debug.pairs = std::move(pairs);
+
+  return {results, debug};
 }
 
 auto Detector::set_diff_threshold(int threshold) -> void {
@@ -163,12 +221,10 @@ auto Detector::extract_color(const cv::Mat& bgr) const -> cv::Mat {
 auto Detector::apply_morphology(const cv::Mat& binary) -> cv::Mat {
   cv::Mat result;
 
-  // Opening: remove noise (3×3 is universal)
   auto kernel_open =
       cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(3, 3));
   cv::morphologyEx(binary, result, cv::MORPH_OPEN, kernel_open);
 
-  // Closing: adaptive kernel based on previous frame's light bar height
   auto close_size = 5;
   auto effective_h = prev_avg_lightbar_height_;
   if (effective_h > 150.0F) {
@@ -222,26 +278,22 @@ auto Detector::filter_light_bars(
     auto w = std::min(rect.size.width, rect.size.height);
     auto h = std::max(rect.size.width, rect.size.height);
 
-    // Aspect ratio
     auto ratio = w / h;
     if (ratio < kRelaxedMinAspectRatio || ratio > kRelaxedMaxAspectRatio) {
       continue;
     }
 
-    // Area
     auto area = cv::contourArea(contour);
     if (area < kRelaxedMinArea || area > kRelaxedMaxArea) {
       continue;
     }
 
-    // Convexity
     auto rect_area = w * h;
     auto convexity = (rect_area > 0.0F) ? (area / rect_area) : 0.0F;
     if (convexity < kRelaxedMinConvexity) {
       continue;
     }
 
-    // Angle normalization: always along the long side
     auto angle = rect.angle;
     if (rect.size.width < rect.size.height) {
       angle += 90.0F;
@@ -275,7 +327,7 @@ auto Detector::compute_pair_cost(const LightBar& a, const LightBar& b)
     return 1.0;
   }
 
-  // Hard reject: bars from same armor plate must have vertical overlap ≥ 50%
+  // Hard reject: bars from same armor plate must have vertical overlap >= 50%
   auto a_top = a.center.y - a.height * 0.5F;
   auto a_bot = a.center.y + a.height * 0.5F;
   auto b_top = b.center.y - b.height * 0.5F;
@@ -287,25 +339,21 @@ auto Detector::compute_pair_cost(const LightBar& a, const LightBar& b)
   auto shorter_h = std::min(a.height, b.height);
   if (overlap / shorter_h < 0.5F) return 1.0;
 
-  // --- f1: Height similarity ---
   auto h_ratio = (h_max > 1e-6F) ? (h_min / h_max) : 0.0F;
   auto h_cost = 1.0 - static_cast<double>(h_ratio);
 
-  // --- f2: Angle difference ---
   auto ang_diff = std::abs(a.angle - b.angle);
   if (ang_diff > 180.0F) {
     ang_diff = 360.0F - ang_diff;
   }
   auto ang_cost = std::min(static_cast<double>(ang_diff) / 45.0, 1.0);
 
-  // --- f3: Y-offset ---
   auto avg_h = (a.height + b.height) / 2.0F;
   auto y_diff = std::abs(a.center.y - b.center.y);
   auto y_cost = (avg_h > 1e-6F)
                     ? std::min(static_cast<double>(y_diff / avg_h), 1.0)
                     : 1.0;
 
-  // --- f4: X-ratio deviation from ideal ---
   auto x_dist = std::abs(a.center.x - b.center.x);
   auto x_ratio = (avg_h > 1e-6F) ? (x_dist / avg_h) : 0.0;
   constexpr double kIdealXRatioSmall = 2.45;
@@ -330,14 +378,12 @@ auto Detector::pair_light_bars(const std::vector<LightBar>& candidates)
     return {};
   }
 
-  // Sort by center.x
   auto sorted = candidates;
   std::sort(sorted.begin(), sorted.end(),
             [](const LightBar& a, const LightBar& b) {
               return a.center.x < b.center.x;
             });
 
-  // Sliding-window scoring
   struct ScoredPair {
     size_t li;
     size_t ri;
@@ -365,13 +411,11 @@ auto Detector::pair_light_bars(const std::vector<LightBar>& candidates)
     return {};
   }
 
-  // Sort by cost (ascending = best first)
   std::sort(scored.begin(), scored.end(),
             [](const ScoredPair& a, const ScoredPair& b) {
               return a.cost < b.cost;
             });
 
-  // Greedy assignment with conflict resolution
   std::vector<bool> used(n, false);
   std::vector<ArmorPair> pairs;
 
