@@ -433,6 +433,8 @@ auto Tracker::update(const std::vector<Armor2D>& detections)
     }
 
     // P0 heartbeat: detect frozen values and force-reset smoothing
+    // If depth and pitch stay identical for kFrozenResetThreshold frames,
+    // the EMA has been locked. Reset the state to unfreeze.
     {
       bool depth_frozen = (ema_initialized_[i] &&
           std::abs(ema_depth_[i] - last_ema_depth_[i]) < 1e-6);

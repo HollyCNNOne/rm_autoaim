@@ -42,5 +42,4 @@ target("rm_autoaim")
   add_links("avcodec", "avformat", "avutil", "swscale")
   add_syslinks("pthread")
 
--- Module unit tests
 includes("tests/reader")

@@ -1,8 +1,8 @@
 #pragma once
 
-#include <Eigen/Dense>
-
 #include <functional>
+
+#include <Eigen/Dense>
 
 namespace rm_autoaim::internal {
 
