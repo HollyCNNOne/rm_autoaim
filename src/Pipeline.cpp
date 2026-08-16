@@ -293,7 +293,7 @@ auto Pipeline::predictor_thread_fn(std::stop_token st) -> void {
     // V4: dt from actual wall-clock elapsed time, not a hardcoded constant
     auto now = std::chrono::steady_clock::now();
     double dt = first_frame
-        ? (1.0 / 142.0)
+        ? (1.0 / 166.7)
         : std::chrono::duration<double>(now - last_process_time).count();
     last_process_time = now;
     first_frame = false;
