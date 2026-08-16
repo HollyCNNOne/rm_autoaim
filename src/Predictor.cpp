@@ -73,10 +73,20 @@ auto Predictor::predict(const std::vector<TrackedArmor>& tracks, double dt)
     results.push_back(state);
   }
 
-  // Remove filters for targets that are no longer tracked
+  // V4: predict-only (no deletion) for unmatched targets.
+  // Filters persist with state propagation so speed estimates are not lost
+  // during brief occlusions. Only delete after kMaxUnmatchedFrames.
   for (int i = static_cast<int>(filters_.size()) - 1; i >= 0; --i) {
     if (!filter_matched[i]) {
-      filters_.erase(filters_.begin() + i);
+      auto& filter = filters_[i];
+      filter.unmatched_count++;
+      if (filter.unmatched_count > kMaxUnmatchedFrames) {
+        filters_.erase(filters_.begin() + i);
+      } else {
+        predict_only(filter, dt);
+      }
+    } else {
+      filters_[i].unmatched_count = 0;
     }
   }
 
@@ -241,6 +251,79 @@ auto Predictor::update_rotation_filter(TargetFilter& filter,
   internal::KalmanFilter3D::MeasVec z;
   z(0) = angle;
   filter.rotation_filter.update(z);
+}
+
+// ============================================================================
+// Predict-Only Propagation (V4)
+// ============================================================================
+
+auto Predictor::predict_only(TargetFilter& filter, double dt) -> void {
+  // Position filter: build transition matrix and process noise, predict only
+  internal::KalmanFilter6D::StateMat Fp;
+  Fp.setIdentity();
+  Fp(0, 3) = dt;
+  Fp(1, 4) = dt;
+  Fp(2, 5) = dt;
+
+  double dt2 = dt * dt / 2.0;
+  double dt3 = dt * dt * dt / 3.0;
+  double q_p = process_noise_pos_;
+  double q_v = process_noise_vel_;
+
+  internal::KalmanFilter6D::StateMat Qp = internal::KalmanFilter6D::StateMat::Zero();
+  for (int i = 0; i < 3; ++i) {
+    Qp(i, i) = q_p * dt3;
+    Qp(i, i + 3) = q_p * dt2;
+    Qp(i + 3, i) = q_p * dt2;
+    Qp(i + 3, i + 3) = q_v * dt;
+  }
+
+  Eigen::Matrix<double, 3, 6> Hp;
+  Hp.setZero();
+  Hp(0, 0) = 1.0;
+  Hp(1, 1) = 1.0;
+  Hp(2, 2) = 1.0;
+
+  Eigen::Matrix3d Rp = Eigen::Matrix3d::Identity() * measurement_noise_pos_;
+
+  filter.position_filter.set_transition(Fp);
+  filter.position_filter.set_process_noise(Qp);
+  filter.position_filter.set_observation(Hp);
+  filter.position_filter.set_measurement_noise(Rp);
+  filter.position_filter.predict();  // no update — just propagate state
+
+  // Rotation filter: build Singer transition, predict only
+  double beta = singer_beta_;
+  double exp_bt = std::exp(-beta * dt);
+  double T = (beta * dt - 1.0 + exp_bt) / (beta * beta);
+
+  internal::KalmanFilter3D::StateMat Fr;
+  Fr.setIdentity();
+  Fr(0, 0) = 1.0;
+  Fr(0, 1) = dt;
+  Fr(0, 2) = T;
+  Fr(1, 1) = 1.0;
+  Fr(1, 2) = (1.0 - exp_bt) / beta;
+  Fr(2, 2) = exp_bt;
+
+  internal::KalmanFilter3D::StateMat Qr = internal::KalmanFilter3D::StateMat::Zero();
+  Qr(0, 0) = process_noise_rot_ * dt * dt * dt / 3.0;
+  Qr(1, 1) = process_noise_rot_ * dt;
+  Qr(2, 2) = process_noise_rot_ * (1.0 - exp_bt * exp_bt) / (2.0 * beta);
+
+  Eigen::Matrix<double, 1, 3> Hr;
+  Hr(0, 0) = 1.0;
+  Hr(0, 1) = 0.0;
+  Hr(0, 2) = 0.0;
+
+  Eigen::Matrix<double, 1, 1> Rr_mat;
+  Rr_mat(0, 0) = measurement_noise_rot_;
+
+  filter.rotation_filter.set_transition(Fr);
+  filter.rotation_filter.set_process_noise(Qr);
+  filter.rotation_filter.set_observation(Hr);
+  filter.rotation_filter.set_measurement_noise(Rr_mat);
+  filter.rotation_filter.predict();  // no update — just propagate state
 }
 
 // ============================================================================

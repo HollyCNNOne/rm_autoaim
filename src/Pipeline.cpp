@@ -2,13 +2,10 @@
 
 #include <chrono>
 
+#include <opencv2/imgproc.hpp>
 #include <spdlog/spdlog.h>
 
 namespace rm_autoaim {
-
-// ============================================================================
-// PerfCounter
-// ============================================================================
 
 auto Pipeline::PerfCounter::record_start() -> void {
   start = std::chrono::steady_clock::now();
@@ -19,10 +16,6 @@ auto Pipeline::PerfCounter::record_end() -> double {
   auto dur = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
   return static_cast<double>(dur.count());
 }
-
-// ============================================================================
-// Construction
-// ============================================================================
 
 Pipeline::Pipeline(const std::string& video_path)
     : reader_(video_path)
@@ -38,11 +31,11 @@ Pipeline::Pipeline(const std::string& video_path)
               std::atomic<std::shared_ptr<std::vector<PredictedState>>>>())
     , aim_slot_(
           std::make_shared<
-              std::atomic<std::shared_ptr<std::vector<AimAngle>>>>()) {}
-
-// ============================================================================
-// Start / Stop
-// ============================================================================
+              std::atomic<std::shared_ptr<std::vector<AimAngle>>>>())
+    , debug_frame_slot_(
+          std::make_shared<std::atomic<std::shared_ptr<cv::Mat>>>())
+    , debug_det_slot_(
+          std::make_shared<std::atomic<std::shared_ptr<Detector::DetectorDebugInfo>>>()) {}
 
 auto Pipeline::start() -> void {
   if (started_.exchange(true)) {
@@ -52,10 +45,8 @@ auto Pipeline::start() -> void {
 
   spdlog::info("Pipeline: starting all modules...");
 
-  // Start reader thread first
   reader_.start();
 
-  // Start processing threads
   reader_thread_ = std::jthread([this](std::stop_token st) {
     reader_thread_fn(st);
   });
@@ -86,10 +77,8 @@ auto Pipeline::stop() -> void {
   predictor_thread_.request_stop();
   ballistic_thread_.request_stop();
 
-  // jthread destructors will auto-join
   spdlog::info("Pipeline: all threads stopped");
 
-  // Print stats
   spdlog::info("=== Pipeline Statistics ===");
   spdlog::info("Reader:    avg={:.1f}us, max={:.1f}us, frames={}",
                stats_.reader.avg_latency_us, stats_.reader.max_latency_us,
@@ -121,16 +110,9 @@ auto Pipeline::stats() const -> PipelineStats { return stats_; }
 
 auto Pipeline::is_done() const -> bool { return done_.load(); }
 
-// ============================================================================
-// Thread Functions
-//
-// Version-based deduplication strategy:
-//   Each producer increments a version counter AFTER storing new data.
-//   Each consumer reads the version and skips processing if unchanged.
-//   This avoids the infinite spin-loop where downstream threads
-//   re-process the same data millions of times.
-// ============================================================================
-
+// Version-based deduplication: each producer increments a version counter
+// after storing new data. Each consumer reads the version and skips
+// processing if unchanged, avoiding infinite re-processing of stale data.
 auto Pipeline::reader_thread_fn(std::stop_token st) -> void {
   spdlog::info("[Reader] thread started");
   PerfCounter perf;
@@ -142,7 +124,6 @@ auto Pipeline::reader_thread_fn(std::stop_token st) -> void {
     double latency = perf.record_end();
 
     if (frame) {
-      // Skip if the same frame (no new frame decoded yet)
       if (frame.get() == last_frame) {
         if (reader_.is_done()) break;
         std::this_thread::sleep_for(std::chrono::microseconds(100));
@@ -187,7 +168,6 @@ auto Pipeline::detector_thread_fn(std::stop_token st) -> void {
       continue;
     }
 
-    // Skip if frame version hasn't changed
     uint64_t cur_version = frame_version_.load(std::memory_order_acquire);
     if (cur_version == last_version) {
       if (done_.load()) break;
@@ -197,13 +177,21 @@ auto Pipeline::detector_thread_fn(std::stop_token st) -> void {
     last_version = cur_version;
 
     perf.record_start();
-    auto detections = detector_.detect(frame->image);
+    auto [detections, det_debug] = detector_.detect_debug(frame->image);
     double latency = perf.record_end();
 
     auto det_ptr = std::make_shared<std::vector<Armor2D>>(std::move(detections));
     det_slot_->store(det_ptr);
     det_version_.fetch_add(1, std::memory_order_release);
     det_slot_->notify_all();
+
+    if (debug_viz_enabled_) {
+      auto debug_frame = std::make_shared<cv::Mat>(frame->image.clone());
+      debug_frame_slot_->store(debug_frame);
+      auto debug_info =
+          std::make_shared<Detector::DetectorDebugInfo>(std::move(det_debug));
+      debug_det_slot_->store(debug_info);
+    }
 
     stats_.detector.frames_processed++;
     stats_.detector.min_latency_us =
@@ -233,7 +221,6 @@ auto Pipeline::tracker_thread_fn(std::stop_token st) -> void {
       continue;
     }
 
-    // Skip if detection version hasn't changed
     uint64_t cur_version = det_version_.load(std::memory_order_acquire);
     if (cur_version == last_version) {
       if (done_.load()) break;
@@ -251,6 +238,18 @@ auto Pipeline::tracker_thread_fn(std::stop_token st) -> void {
     track_slot_->store(track_ptr);
     track_version_.fetch_add(1, std::memory_order_release);
     track_slot_->notify_all();
+
+    if (debug_viz_enabled_) {
+      auto debug_frame = debug_frame_slot_->load();
+      auto debug_det = debug_det_slot_->load();
+      auto dets = det_slot_->load();
+      auto aims = aim_slot_->load();
+      if (debug_frame && debug_det && dets) {
+        draw_debug_frame(*debug_frame, *debug_det, *dets,
+                         *track_ptr,
+                         aims ? *aims : std::vector<AimAngle>{});
+      }
+    }
 
     stats_.tracker.frames_processed++;
     stats_.tracker.min_latency_us =
@@ -271,9 +270,9 @@ auto Pipeline::predictor_thread_fn(std::stop_token st) -> void {
   spdlog::info("[Predictor] thread started");
   PerfCounter perf;
 
-  // Frame interval for outpost video: ~7ms at 142 FPS
-  constexpr double kDefaultDt = 1.0 / 142.0;
   uint64_t last_version = 0;
+  auto last_process_time = std::chrono::steady_clock::now();
+  bool first_frame = true;
 
   while (!st.stop_requested()) {
     auto tracks = track_slot_->load();
@@ -283,7 +282,6 @@ auto Pipeline::predictor_thread_fn(std::stop_token st) -> void {
       continue;
     }
 
-    // Skip if track version hasn't changed
     uint64_t cur_version = track_version_.load(std::memory_order_acquire);
     if (cur_version == last_version) {
       if (done_.load()) break;
@@ -292,8 +290,16 @@ auto Pipeline::predictor_thread_fn(std::stop_token st) -> void {
     }
     last_version = cur_version;
 
+    // V4: dt from actual wall-clock elapsed time, not a hardcoded constant
+    auto now = std::chrono::steady_clock::now();
+    double dt = first_frame
+        ? (1.0 / 142.0)
+        : std::chrono::duration<double>(now - last_process_time).count();
+    last_process_time = now;
+    first_frame = false;
+
     perf.record_start();
-    auto predictions = predictor_.predict(*tracks, kDefaultDt);
+    auto predictions = predictor_.predict(*tracks, dt);
     double latency = perf.record_end();
 
     auto pred_ptr =
@@ -333,7 +339,6 @@ auto Pipeline::ballistic_thread_fn(std::stop_token st) -> void {
       continue;
     }
 
-    // Skip if prediction version hasn't changed
     uint64_t cur_version = pred_version_.load(std::memory_order_acquire);
     if (cur_version == last_version) {
       if (done_.load()) break;
@@ -365,6 +370,95 @@ auto Pipeline::ballistic_thread_fn(std::stop_token st) -> void {
   }
 
   spdlog::info("[Ballistic] thread finished");
+}
+
+auto Pipeline::enable_debug_viz(const std::string& output_path) -> void {
+  debug_viz_path_ = output_path;
+  debug_viz_enabled_ = true;
+}
+
+auto Pipeline::draw_debug_frame(
+    const cv::Mat& frame,
+    const Detector::DetectorDebugInfo& det_debug,
+    const std::vector<Armor2D>& detections,
+    const std::vector<TrackedArmor>& tracks,
+    const std::vector<AimAngle>& aims) -> void {
+  cv::Mat viz = frame.clone();
+
+  // Blue: light bar candidates (Step 4 output)
+  for (const auto& lb : det_debug.light_bars) {
+    cv::Point2f vertices[4];
+    lb.rect.points(vertices);
+    for (int i = 0; i < 4; ++i) {
+      cv::line(viz, vertices[i], vertices[(i + 1) % 4],
+               cv::Scalar(255, 0, 0), 2);
+    }
+  }
+
+  // Green: armor pairs (Step 5, before Step 6 filtering)
+  for (const auto& pair : det_debug.pairs) {
+    auto corners = Detector::extract_corners(pair);
+    for (int i = 0; i < 4; ++i) {
+      cv::line(viz, corners[i], corners[(i + 1) % 4],
+               cv::Scalar(0, 255, 0), 2);
+    }
+  }
+
+  // Red: tracked armors with ID, status, depth, and aim angles
+  for (const auto& t : tracks) {
+    for (int i = 0; i < 4; ++i) {
+      cv::line(viz, t.detection.corners[i],
+               t.detection.corners[(i + 1) % 4],
+               cv::Scalar(0, 0, 255), 2);
+    }
+
+    auto cx = (t.detection.corners[0].x + t.detection.corners[1].x +
+               t.detection.corners[2].x + t.detection.corners[3].x) / 4.0F;
+    auto cy = (t.detection.corners[0].y + t.detection.corners[1].y +
+               t.detection.corners[2].y + t.detection.corners[3].y) / 4.0F;
+
+    cv::putText(viz, "ID:" + std::to_string(t.id),
+                cv::Point2f(cx - 30.0F, cy - 30.0F),
+                cv::FONT_HERSHEY_SIMPLEX, 0.7,
+                cv::Scalar(0, 0, 255), 2);
+
+    const char* status_str =
+        (t.status == TrackedArmor::Status::kConfirmed) ? "CONFIRMED" :
+        (t.status == TrackedArmor::Status::kLost)      ? "LOST" : "TENTATIVE";
+    cv::putText(viz, status_str,
+                cv::Point2f(cx - 30.0F, cy - 8.0F),
+                cv::FONT_HERSHEY_SIMPLEX, 0.45,
+                cv::Scalar(0, 0, 255), 1);
+
+    auto depth_str = cv::format("Z:%.2fm", t.pose.depth);
+    cv::putText(viz, depth_str,
+                cv::Point2f(cx - 30.0F, cy + 12.0F),
+                cv::FONT_HERSHEY_SIMPLEX, 0.45,
+                cv::Scalar(0, 0, 255), 1);
+
+    for (const auto& aim : aims) {
+      if (aim.target_id == t.id) {
+        auto aim_str = cv::format("yaw:%.1f pit:%.1f t:%.0fms",
+                                  aim.yaw * 180.0 / CV_PI,
+                                  aim.pitch * 180.0 / CV_PI,
+                                  aim.flight_time * 1000.0);
+        cv::putText(viz, aim_str,
+                    cv::Point2f(cx - 30.0F, cy + 32.0F),
+                    cv::FONT_HERSHEY_SIMPLEX, 0.4,
+                    cv::Scalar(0, 0, 255), 1);
+        break;
+      }
+    }
+  }
+
+  if (!debug_writer_.isOpened()) {
+    debug_writer_.open(debug_viz_path_,
+                       cv::VideoWriter::fourcc('X', 'V', 'I', 'D'),
+                       142.0,
+                       cv::Size(frame.cols, frame.rows));
+  }
+
+  debug_writer_.write(viz);
 }
 
 }  // namespace rm_autoaim

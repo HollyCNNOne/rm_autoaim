@@ -35,6 +35,7 @@ private:
     internal::KalmanFilter6D position_filter;  // CV model
     internal::KalmanFilter3D rotation_filter;  // Singer model
     bool initialized{false};
+    int unmatched_count{0};  // V4: consecutive frames without measurement
   };
 
   // Initialize a new filter for a target
@@ -47,6 +48,9 @@ private:
   // Update rotation filter with measurement
   auto update_rotation_filter(TargetFilter& filter,
                               const ArmorPose& pose, double dt) -> void;
+
+  // V4: predict-only propagation (no measurement update) for unmatched targets
+  auto predict_only(TargetFilter& filter, double dt) -> void;
 
   // Extract rotation angle from pose
   [[nodiscard]] static auto extract_rotation_angle(const ArmorPose& pose)
@@ -65,6 +69,9 @@ private:
   double measurement_noise_pos_{0.001};  // position measurement noise
   double measurement_noise_rot_{0.01};   // rotation measurement noise
   double singer_beta_{0.5};  // Singer model maneuver frequency
+
+  // V4: max consecutive unmatched frames before filter deletion
+  static constexpr int kMaxUnmatchedFrames{15};
 };
 
 }  // namespace rm_autoaim
