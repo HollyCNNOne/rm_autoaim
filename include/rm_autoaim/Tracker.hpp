@@ -1,8 +1,10 @@
 #pragma once
 
 #include "rm_autoaim/Types.hpp"
+#include "rm_autoaim/internal/TurretEKF.hpp"
 
 #include <array>
+#include <chrono>
 #include <deque>
 #include <queue>
 #include <vector>
@@ -11,17 +13,36 @@
 
 namespace rm_autoaim {
 
-// V3.3: Physics-Guided Tracking
-// Four core upgrades over V3.2:
-//   1. Expected-ID state machine — visual-evidence-driven, not clock-driven
-//   2. Physics consistency check — rejects impossible PnP results
-//   3. Median-anchored deviation clamp — prevents EMA baseline drift
-//   4. Quaternion SLERP — handles ±180° yaw boundary naturally
+// ============================================================================
+// V7: Dual-Loop Turret-Centric Tracker (SCUT × HKUST fusion)
+// ============================================================================
+// Architecture:
+//   Loop 1 (EKF):    TurretEKF::predict() every frame → continuous state
+//                     TurretEKF::update() when matched → measurement correction
+//   Loop 2 (Matching): prediction-based cost matrix → Hungarian → assignments
+//
+// Three upgrades over V6:
+//   1. TurretEKF replaces "three independent armor plates" with "turret center
+//      + armor phase" tracking (SCUT approach)
+//   2. Prediction-based soft matching replaces hard inertia bonus (HKUST approach)
+//   3. Four-state lifecycle machine (INACTIVE→TENTATIVE→CONFIRMED↔LOST)
+//      replaces binary active/inactive
+// ============================================================================
+
 class Tracker {
 public:
+  // HKUST-style fine-grained state machine
+  enum class SlotStatus {
+    kInactive,   // slot is free, available for new detection
+    kTentative,  // newly detected, needs N consecutive hits to confirm
+    kConfirmed,  // tracking normally
+    kLost        // temporarily lost, still predicting via EKF
+  };
+
   Tracker();
 
-  [[nodiscard]] auto update(const std::vector<Armor2D>& detections)
+  // dt: actual frame interval from steady_clock (seconds)
+  [[nodiscard]] auto update(const std::vector<Armor2D>& detections, double dt)
       -> std::vector<TrackedArmor>;
 
   [[nodiscard]] auto tracks() const -> std::vector<TrackedArmor>;
@@ -29,13 +50,11 @@ public:
   auto reset() -> void;
 
 private:
-  [[nodiscard]] auto solve_pnp(const Armor2D& detection)
-      -> ArmorPose;
+  [[nodiscard]] auto solve_pnp(const Armor2D& detection) -> ArmorPose;
 
   [[nodiscard]] auto associate(
       const std::vector<Armor2D>& detections,
-      const std::vector<TrackedArmor>& tracks,
-      int expected_id)
+      const std::vector<int>& active_slots)
       -> std::tuple<std::vector<std::pair<int, int>>,
                     std::vector<int>,
                     std::vector<int>>;
@@ -43,60 +62,60 @@ private:
   [[nodiscard]] static auto compute_iou(const Armor2D& a, const Armor2D& b)
       -> double;
 
-  // Fixed-slot architecture
+  // =========================================================================
+  // Core: Turret-centric EKF (SCUT approach)
+  // =========================================================================
+  internal::TurretEKF ekf_;
+  bool ekf_initialized_{false};
+
+  // =========================================================================
+  // Phase slots: 3 fixed armor plates, each with a fixed phase offset
+  // =========================================================================
   static constexpr int kMaxSlots{3};
-  static constexpr int kTimeoutFrames{15};
-  std::array<TrackedArmor, kMaxSlots> slots_;
-  bool slot_active_[kMaxSlots]{};
-  int slot_timeout_[kMaxSlots]{};
-  std::queue<int> free_slots_;
-  int frame_counter_{0};
-  int prev_active_count_{0};
+  static constexpr double kPhaseOffsets[3];  // {0, 2π/3, 4π/3}
+  static constexpr int kTimeoutFrames{15};   // lease: ~90ms @ 166.7FPS
+  static constexpr double kNominalDt{1.0 / 166.7};
+
+  TrackedArmor slots_[kMaxSlots];
+  SlotStatus slot_status_[kMaxSlots]{};
+  int slot_timeout_[kMaxSlots]{};       // lease countdown
+  int slot_hit_count_[kMaxSlots]{};     // consecutive hits
+  int slot_miss_count_[kMaxSlots]{};    // consecutive misses
+  std::queue<int> free_slots_;          // INACTIVE slots available for assignment
 
   // =========================================================================
-  // V3.3 Problem 1: Expected-ID state machine (visual-evidence-driven)
-  // "Tend toward 0→1→2 but allow breaking the order when physics demands it."
+  // State machine thresholds (HKUST approach)
   // =========================================================================
-  int expected_id_{0};
-  int expected_id_miss_counter_{0};        // frames current ID not matched
-  int expected_id_skip_counter_{0};        // frames NEXT ID not detected
-  static constexpr int kMissAdvanceThreshold{5};   // 5 misses → advance
-  static constexpr int kSkipToleranceThreshold{8};  // 8 absent → skip (adj2: was 20)
-  static constexpr int kAdvanceCooldownFrames{5};   // cooldown after advance
-  int id_advance_cooldown_{0};
-
-  // Adjust 1: Max dwell time — force advance even if ID is still matched
-  // Physical window ≈ 72 frames / ID. Dwell limit = 65 frames (~390ms).
-  static constexpr int kMaxDwellFrames{65};  // Tuning 2: was 58, +7 frames buffer
-  int id_dwell_counter_{0};
-
-  // Adjust 3+4: Fast scan mode after skip, skip storm suppression
-  static constexpr int kFastScanFrames{3};         // fast scan lasts 3 frames
-  static constexpr int kFastScanThreshold{2};       // shorter miss threshold in scan
-  static constexpr int kMaxConsecutiveSkips{2};     // Tuning 1: brake after 2 skips
-  bool fast_scan_mode_{false};
-  int fast_scan_counter_{0};
-  int consecutive_skips_{0};
-  bool skip_brake_{false};  // Tuning 1: lock skip logic, wait for real detection
-
-  // Tuning 3: Force-switch first frame — reuse historical pose, not raw PnP
-  bool force_switched_{false};  // set by dwell timeout / skip, cleared after Phase 5
+  static constexpr int kTentativeHitThreshold{3};    // 3 hits → CONFIRMED
+  static constexpr int kLostMissThreshold{5};         // 5 misses in CONFIRMED → LOST
+  static constexpr int kInactiveMissThreshold{10};    // 10 misses in LOST → INACTIVE
+  static constexpr int kTentativeMissThreshold{1};    // 1 miss in TENTATIVE → INACTIVE
 
   // =========================================================================
-  // V3.3 Problem 2: Physics consistency check
-  // "Reject physically impossible values regardless of PnP convergence."
+  // Prediction-based matching (HKUST approach)
+  // Replaces hard inertia bonus with soft multi-dimensional cost
+  // =========================================================================
+  // cost = w_iou * (1 - iou) + w_pred * pred_error_norm + w_center * center_dist_norm
+  static constexpr double kWeightIoU{0.50};
+  static constexpr double kWeightPred{0.30};
+  static constexpr double kWeightCenter{0.20};
+  static constexpr double kMaxPredError{0.50};    // 50cm max prediction error (norm reference)
+  static constexpr double kMaxCenterDist{300.0};  // 300px max center distance (norm reference)
+  static constexpr double kIoUMin{0.45};           // minimum IoU for match
+
+  // =========================================================================
+  // V3.3 Retained: Physics consistency check + Smoothing
   // =========================================================================
   static constexpr double kMaxDepthM{15.0};
   static constexpr double kMinDepthM{0.5};
-  static constexpr double kMaxPitchRad{0.5236};   // ±30°
-  static constexpr double kMaxDeltaYawRad{0.5236}; // 30°/frame
-  static constexpr double kMaxDeltaDepthM{2.0};    // 2m/frame
+  static constexpr double kMaxPitchRad{0.5236};     // ±30°
+  static constexpr double kMaxDeltaYawRad{0.5236};  // 30°/frame
+  static constexpr double kMaxDeltaDepthM{2.0};     // 2m/frame
   static constexpr double kMaxDeltaPitchRad{0.2618}; // 15°/frame
 
-  // P5: Recovery protection after physics validation failure
-  static constexpr int kRecoveryFrames{1};  // P0: was 3, 1 frame is enough to block spike
+  static constexpr int kRecoveryFrames{1};
   static constexpr double kRecoveryAlpha{0.30};
-  std::array<int, kMaxSlots> recovery_counter_{}; // 0 = normal, >0 = in recovery
+  std::array<int, kMaxSlots> recovery_counter_{};
 
   struct LastValidPose {
     double pitch{0.0};
@@ -106,10 +125,7 @@ private:
   };
   std::array<LastValidPose, kMaxSlots> last_valid_;
 
-  // =========================================================================
-  // V3.3 Problem 3: Median-anchored deviation clamp
-  // "Stable baseline never drifts; only local fluctuations are allowed."
-  // =========================================================================
+  // Median-anchored smoothing
   static constexpr int kHistoryWindowSize{15};
   static constexpr double kDeviationClampRatio{0.30};
   static constexpr double kDepthEmaAlpha{0.25};
@@ -118,32 +134,20 @@ private:
   std::array<double, kMaxSlots> ema_depth_{};
   std::array<double, kMaxSlots> ema_pitch_{};
   std::array<bool, kMaxSlots> ema_initialized_{};
-  std::array<bool, kMaxSlots> slot_just_activated_{};  // P2: first frame after (re)activation
+  std::array<bool, kMaxSlots> slot_just_activated_{};
 
-  // P0 heartbeat: force-reset smoothing if values stay frozen too long
+  // Frozen detection
   static constexpr int kFrozenResetThreshold{20};
   std::array<int, kMaxSlots> consecutive_frozen_{};
   std::array<double, kMaxSlots> last_ema_depth_{};
   std::array<double, kMaxSlots> last_ema_pitch_{};
 
-  // =========================================================================
-  // V3.3 Problem 4: Quaternion SLERP
-  // "Solve the ±180° singularity at the mathematical representation level."
-  // =========================================================================
+  // Quaternion SLERP
   static constexpr double kSlerpAlpha{0.25};
   std::array<Eigen::Quaterniond, kMaxSlots> prev_quat_;
   std::array<bool, kMaxSlots> quat_initialized_{};
 
-  // =========================================================================
-  // V3.2 Retained: Hungarian cost bonuses
-  // =========================================================================
-  static constexpr double kPhaseBonusMatch{-0.10};
-  static constexpr double kPhaseBonusMismatch{0.02};
-  static constexpr double kInertiaBonus{-0.30};
-  static constexpr double kInertiaMinIoU{0.3};
-  std::vector<Armor2D> prev_detections_;
-  std::vector<int> prev_det_to_slot_;
-
+  // Camera intrinsics
   cv::Mat camera_matrix_;
   cv::Mat dist_coeffs_;
   std::vector<cv::Point3f> model_points_;
