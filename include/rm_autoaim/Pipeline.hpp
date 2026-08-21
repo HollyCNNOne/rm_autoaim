@@ -87,14 +87,21 @@ private:
                         const Detector::DetectorDebugInfo& det_debug,
                         const std::vector<Armor2D>& detections,
                         const std::vector<TrackedArmor>& tracks,
-                        const std::vector<AimAngle>& aims) -> void;
+                        const std::vector<AimAngle>& aims) -> cv::Mat;
+
+  auto render_thread_fn(std::stop_token st) -> void;
 
   std::shared_ptr<std::atomic<std::shared_ptr<cv::Mat>>> debug_frame_slot_;
   std::shared_ptr<std::atomic<std::shared_ptr<Detector::DetectorDebugInfo>>>
       debug_det_slot_;
-  cv::VideoWriter debug_writer_;
   std::string debug_viz_path_;
   bool debug_viz_enabled_{false};
+
+  // V5.1: Independent render thread — drawing fully decoupled from pipeline
+  std::jthread render_thread_;
+  std::atomic<bool> render_running_{false};
+  int render_frame_counter_{0};
+  static constexpr int kVizDecimate{3};
 };
 
 }  // namespace rm_autoaim

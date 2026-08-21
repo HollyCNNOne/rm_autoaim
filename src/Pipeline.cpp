@@ -77,6 +77,10 @@ auto Pipeline::stop() -> void {
   predictor_thread_.request_stop();
   ballistic_thread_.request_stop();
 
+  if (render_running_.load()) {
+    render_thread_.request_stop();
+  }
+
   spdlog::info("Pipeline: all threads stopped");
 
   spdlog::info("=== Pipeline Statistics ===");
@@ -213,6 +217,9 @@ auto Pipeline::tracker_thread_fn(std::stop_token st) -> void {
   PerfCounter perf;
   uint64_t last_version = 0;
 
+  auto last_process_time = std::chrono::steady_clock::now();
+  bool first_frame = true;
+
   while (!st.stop_requested()) {
     auto detections = det_slot_->load();
     if (!detections) {
@@ -229,8 +236,16 @@ auto Pipeline::tracker_thread_fn(std::stop_token st) -> void {
     }
     last_version = cur_version;
 
+    // V7: dt from actual wall-clock elapsed time for EKF predict
+    auto now = std::chrono::steady_clock::now();
+    double dt = first_frame
+        ? (1.0 / 166.7)
+        : std::chrono::duration<double>(now - last_process_time).count();
+    last_process_time = now;
+    first_frame = false;
+
     perf.record_start();
-    auto tracks = tracker_.update(*detections);
+    auto tracks = tracker_.update(*detections, dt);
     double latency = perf.record_end();
 
     auto track_ptr =
@@ -238,18 +253,6 @@ auto Pipeline::tracker_thread_fn(std::stop_token st) -> void {
     track_slot_->store(track_ptr);
     track_version_.fetch_add(1, std::memory_order_release);
     track_slot_->notify_all();
-
-    if (debug_viz_enabled_) {
-      auto debug_frame = debug_frame_slot_->load();
-      auto debug_det = debug_det_slot_->load();
-      auto dets = det_slot_->load();
-      auto aims = aim_slot_->load();
-      if (debug_frame && debug_det && dets) {
-        draw_debug_frame(*debug_frame, *debug_det, *dets,
-                         *track_ptr,
-                         aims ? *aims : std::vector<AimAngle>{});
-      }
-    }
 
     stats_.tracker.frames_processed++;
     stats_.tracker.min_latency_us =
@@ -375,6 +378,10 @@ auto Pipeline::ballistic_thread_fn(std::stop_token st) -> void {
 auto Pipeline::enable_debug_viz(const std::string& output_path) -> void {
   debug_viz_path_ = output_path;
   debug_viz_enabled_ = true;
+  render_running_.store(true);
+  render_thread_ = std::jthread([this](std::stop_token st) {
+    render_thread_fn(st);
+  });
 }
 
 auto Pipeline::draw_debug_frame(
@@ -382,7 +389,7 @@ auto Pipeline::draw_debug_frame(
     const Detector::DetectorDebugInfo& det_debug,
     const std::vector<Armor2D>& detections,
     const std::vector<TrackedArmor>& tracks,
-    const std::vector<AimAngle>& aims) -> void {
+    const std::vector<AimAngle>& aims) -> cv::Mat {
   cv::Mat viz = frame.clone();
 
   // Blue: light bar candidates (Step 4 output)
@@ -451,14 +458,54 @@ auto Pipeline::draw_debug_frame(
     }
   }
 
-  if (!debug_writer_.isOpened()) {
-    debug_writer_.open(debug_viz_path_,
-                       cv::VideoWriter::fourcc('X', 'V', 'I', 'D'),
-                       142.0,
-                       cv::Size(frame.cols, frame.rows));
+  return viz;
+}
+
+auto Pipeline::render_thread_fn(std::stop_token st) -> void {
+  spdlog::info("[Render] thread started");
+
+  cv::VideoWriter writer;
+  writer.open(debug_viz_path_,
+              cv::VideoWriter::fourcc('M', 'J', 'P', 'G'),
+              30.0,
+              cv::Size(960, 600));
+
+  if (!writer.isOpened()) {
+    spdlog::error("[Render] failed to open '{}'", debug_viz_path_);
+    return;
   }
 
-  debug_writer_.write(viz);
+  uint64_t last_det_version = 0;
+
+  while (!st.stop_requested()) {
+    uint64_t cur_version = det_version_.load(std::memory_order_acquire);
+    if (cur_version == last_det_version) {
+      if (done_.load()) break;
+      std::this_thread::sleep_for(std::chrono::microseconds(500));
+      continue;
+    }
+    last_det_version = cur_version;
+
+    // Decimate: draw only 1 frame every kVizDecimate
+    if (++render_frame_counter_ % kVizDecimate != 0) continue;
+
+    auto debug_frame = debug_frame_slot_->load();
+    auto debug_det = debug_det_slot_->load();
+    auto dets = det_slot_->load();
+    auto tracks = track_slot_->load();
+    auto aims = aim_slot_->load();
+
+    if (debug_frame && debug_det && dets && tracks) {
+      auto viz = draw_debug_frame(*debug_frame, *debug_det, *dets, *tracks,
+                                  aims ? *aims : std::vector<AimAngle>{});
+      cv::Mat viz_small;
+      cv::resize(viz, viz_small, cv::Size(960, 600));
+      writer.write(viz_small);
+    }
+  }
+
+  writer.release();
+  spdlog::info("[Render] thread finished");
 }
 
 }  // namespace rm_autoaim
