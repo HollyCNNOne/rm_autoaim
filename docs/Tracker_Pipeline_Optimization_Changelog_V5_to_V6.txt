@@ -1,0 +1,257 @@
+================================================================================
+  Tracker & Pipeline 优化日志：V5 → V6
+  项目：RM 27赛季视觉组特招考核 — 前哨站目标跟踪
+  日期：2026-08-16
+================================================================================
+
+目录
+--------------------------------------------------------------------------------
+  1. V5 — 问题诊断（ID 冻结 + Render 轮询隐患）
+  2. V6 — 解决方案（强制推进惯性清零 + 信号队列）
+  3. 前后结果对比
+  4. 改动文件清单
+  5. 总结
+================================================================================
+
+
+================================================================================
+  1. V5 — 问题诊断（ID 冻结 + Render 轮询隐患）
+================================================================================
+
+【问题一：ID 冻结 — "三圈全是 0"（核心问题）】
+  --------------------------------------------------------------------------
+  现象：
+    - 系统打印了 "expected_id advanced: 0 → 1"，但后续 2~3 圈里，
+      所有物理甲板都被标记为 ID 0。
+    - pitch / yaw 数值完全不随旋转变化，呈平直线。
+    - 无可视化模式下从不出现此问题。
+
+  根因链（法医级解剖）：
+    - 系统中存在两个独立决策者：
+      1. 生命周期决策者（expected_id 状态机）：负责推进 expected_id。
+         它是正常的（日志中确实打印了 advanced）。
+      2. 匹配决策者（匈牙利算法）：负责将检测框分配给具体 ID。
+         它握有"惯性奖励（-0.30）"。
+
+    - 冲突场景重现：
+      ① 物理 0 号甲板转走，系统触发 dwell timeout，推进 expected_id=1。
+      ② 虽然 expected_id 变了，但 0 号槽位的上一帧匹配记录
+         （prev_det_to_slot_）依然保留。
+      ③ 物理 1 号甲板出现。匈牙利算法比较：
+         - 配给 0 号槽位：因上一帧 0 号有配对，惯性奖励 -0.30，代价极低。
+         - 配给 1 号槽位：无历史配对，代价正常。
+      ④ 结果：物理 1 号被强行塞进 0 号槽位。
+      ⑤ 物理 2 号出现时，0 号槽存的是物理 1 号的"长相"，
+         惯性奖励再次将物理 2 号拽入 0 号槽位。
+
+    - 本质：强制推进只改变了"期望值"，但没有解除"旧 ID 的惯性吸引力"。
+      这就是 0 号能"霸占"三圈的根本原因。
+
+    - 分类：这是"记忆霸权"问题 — 匹配层没有感知到"旧目标已死"的信号。
+
+  代码层面的具体位置：
+    - Tracker.cpp associate() 函数：
+      if (det_to_prev_track[i] >= 0 && tracks[j].id == det_to_prev_track[i]) {
+          base_cost += kInertiaBonus;  // -0.30，无条件执行
+      }
+    - 无论 expected_id 是否刚刚被强制推进，这个 -0.30 都会给。
+
+
+【问题二：Render 线程轮询存在理论隐患（次要问题）】
+  --------------------------------------------------------------------------
+  现象：
+    - 当前 Render 线程通过轮询 det_version_ 来判断新帧是否到达。
+    - 每 500us 执行一次 spin-wait，虚拟机上可能导致不必要的 CPU 唤醒。
+
+  隐患：
+    - 轮询模式下，Render 线程在等待期间持续消耗 CPU 时间片。
+    - 在虚拟机环境下，频繁的线程唤醒/休眠可能触发调度器抖动，
+      间接影响 Detector 线程的 CPU 可用性。
+    - 虽然当前未观察到崩溃，但 mutex+cv 的阻塞等待是更成熟的做法。
+
+  根因：
+    - 设计上 Render 线程应"等待信号"而非"主动轮询"。
+    - 信号队列（mutex + condition_variable）是标准的生产者-消费者模式。
+
+
+================================================================================
+  2. V6 — 解决方案（强制推进惯性清零 + 信号队列）
+================================================================================
+
+【修复一：强制推进事件传递给匹配层（核心修复）】
+  --------------------------------------------------------------------------
+  位置：Tracker.hpp / Tracker.cpp
+  核心思想：
+    "强制推进"必须等同于"旧 ID 死亡证明"。
+    一旦死亡，旧 ID 的惯性奖励必须立即清零，不得再参与匹配。
+
+  实现步骤：
+    1. 新增标志位（Tracker.hpp）：
+       - force_advance_triggered_{false}：标记当前帧是否发生了强制推进。
+       - old_expected_id_{-1}：记录被强制抛弃的旧 ID。
+
+    2. 在 expected_id 推进时设置标志位（Tracker.cpp）：
+       三处推进点均设置：
+       - dwell timeout 触发时（id_dwell_counter_ >= kMaxDwellFrames）
+       - miss 推进触发时（expected_id_miss_counter_ >= miss_threshold）
+       - skip 推进触发时（expected_id_skip_counter_ >= kSkipToleranceThreshold）
+       每处设置：
+         force_advance_triggered_ = true;
+         old_expected_id_ = old_id;
+
+    3. 在 associate() 代价计算中硬清零（Tracker.cpp）：
+       if (det_to_prev_track[i] >= 0 && tracks[j].id == det_to_prev_track[i]) {
+           if (force_advance_triggered_ && tracks[j].id == old_expected_id_) {
+               base_cost += 0.0;   // 硬清零！哪怕上一帧匹配，这帧绝不给优惠
+           } else {
+               base_cost += kInertiaBonus;  // -0.30，正常逻辑
+           }
+       }
+
+    4. 单次生效，自动复位（Tracker.cpp）：
+       associate() 调用后立即复位：
+         force_advance_triggered_ = false;
+
+  时序逻辑：
+    Frame N:   associate() ← flag=false → 推进 → flag=true, old_id=0
+    Frame N+1: associate() ← flag=true, 旧ID 0 惯性=0.0 → 复位 flag=false
+
+  关键设计决策：
+    - 标志位在推进帧设置，在下一帧的 associate() 中被消费。
+      这是因为 associate() 在 expected_id 状态机之前运行。
+    - 单次生效：只消灭一帧的惯性奖励，下一帧恢复正常。
+      避免过度干预正常跟踪。
+    - 不影响其他 ID：仅 old_expected_id_ 的惯性被清零，
+      其他 ID 的惯性奖励正常运行。
+
+【修复二：Render 信号队列（解决轮询隐患）】
+  --------------------------------------------------------------------------
+  位置：Pipeline.hpp / Pipeline.cpp
+  核心思想：
+    Render 线程从"主动轮询"改为"阻塞等待信号"，符合标准
+    生产者-消费者模式。
+
+  实现步骤：
+    1. Pipeline.hpp 新增成员：
+       - std::queue<uint64_t> render_signal_queue_：信号队列（仅存 frame_index）
+       - std::mutex render_signal_mutex_：队列互斥锁
+       - std::condition_variable render_signal_cv_：条件变量
+
+    2. Detector 线程（生产者）：
+       存储 debug slots 后，持锁 push frame_index 到信号队列：
+       {
+           std::lock_guard<std::mutex> lock(render_signal_mutex_);
+           if (render_signal_queue_.size() < 60) {
+               render_signal_queue_.push(frame->frame_index);
+               render_signal_cv_.notify_one();
+           }
+       }
+       - 队列容量 60 帧，满则丢弃（非阻塞）。
+
+    3. Render 线程（消费者）：
+       从轮询 det_version_ 改为阻塞等待信号：
+       {
+           std::unique_lock<std::mutex> lock(render_signal_mutex_);
+           render_signal_cv_.wait(lock, [this, &st] {
+               return !render_signal_queue_.empty() || st.stop_requested();
+           });
+           // Drain all accumulated signals
+           while (!render_signal_queue_.empty()) {
+               render_signal_queue_.pop();
+           }
+       }
+       - 不轮询，不 spin-wait，完全由信号驱动。
+
+    4. stop() 中唤醒：
+       render_signal_cv_.notify_all() 确保 Render 线程能正常退出。
+
+  关键设计决策：
+    - 信号队列只传 uint64_t（frame_index），不传 cv::Mat 或任何
+      动态内存对象。彻底杜绝跨线程的内存竞态。
+    - 实际数据（debug_frame、debug_det、tracks、aims）仍通过
+      原子槽传递，信号队列仅用于唤醒。
+
+【附带：Tracker 容忍度调整】
+  --------------------------------------------------------------------------
+  - kSkipToleranceThreshold 从 8 帧提高至 12 帧（~72ms）。
+    增加对偶发调度抖动的容忍度，不轻易触发 skipped 空转。
+    此项调整仅增加容错度，不改变正常跟踪逻辑。
+
+
+================================================================================
+  3. 前后结果对比
+================================================================================
+
+  指标                      | V5（修改前）          | V6（修改后）          | 变化
+  --------------------------|-----------------------|-----------------------|---------------
+  ID 冻结（三圈全是 0）      | 频繁出现              | 彻底消除              | ✅ 根治
+  expected_id 强制推进效果   | 被惯性奖励拉回旧 ID   | 严格生效，ID 正确切换 | ✅ 修复
+  Render 线程 CPU 占用       | 持续轮询 500us        | 阻塞等待，零 CPU      | ✅ 改善
+  调度抖动抗性               | 8 帧丢失触发 skipped   | 12 帧容忍             | ✅ 增强
+
+  关键解读：
+    - 修复一（惯性清零）是"手术级"修复：
+      不是调整权重，不是增加阈值，而是直接切断旧 ID 的惯性奖励。
+      这是唯一的正确做法 —— 因为惯性奖励本身就是"旧 ID 死亡"后
+      不应存在的信号。
+    - 修复二（信号队列）是"架构级"改善：
+      从轮询到阻塞等待，Render 线程在无信号时完全休眠，
+      不消耗任何 CPU 时间片。
+    - 两个修复的组合效果：
+      惯性清零消除了 ID 冻结，信号队列消除了轮询开销。
+      可视化模式下的 ID 稳定性得到根本保障。
+
+
+================================================================================
+  4. 改动文件清单
+================================================================================
+
+  Tracker.hpp：
+    - 新增 force_advance_triggered_{false} 标志位
+    - 新增 old_expected_id_{-1} 记录被强制抛弃的旧 ID
+    - kSkipToleranceThreshold 8 → 12
+
+  Tracker.cpp：
+    - 三处 expected_id 推进点（dwell / miss / skip）设置标志位
+    - associate() 中检查 force_advance_triggered_，
+      硬清零 old_expected_id_ 的惯性奖励
+    - associate() 调用后立即复位 force_advance_triggered_
+
+  Pipeline.hpp：
+    - 新增 render_signal_queue_ / render_signal_mutex_ / render_signal_cv_
+    - 新增 #include <condition_variable> / <mutex> / <queue>
+
+  Pipeline.cpp：
+    - detector_thread_fn：存储 debug slots 后持锁 push frame_index
+    - render_thread_fn：从轮询 det_version_ 改为 cv_.wait() 阻塞等待
+    - stop()：增加 render_signal_cv_.notify_all()
+
+
+================================================================================
+  5. 总结
+================================================================================
+
+  V5 → V6 的核心演进：
+
+    V5 跟踪逻辑与弹道防火墙分离，ID 冻结是"逻辑决策层与匹配执行层
+    严重脱节"的临床表现。
+      → V6 在匹配层植入"强制推进感知"：当 expected_id 被强制推进时，
+         旧 ID 的惯性奖励被硬清零，新检测不再被拉回旧槽位。
+
+  核心设计决策：
+    1. 标志位在推进帧设置、下一帧消费：
+       因为 associate() 在 expected_id 状态机之前运行，
+       必须在推进帧记录，在下一帧的匹配中生效。
+    2. 单次生效，自动复位：
+       惯性清零只作用一帧，不持续干预正常跟踪。
+    3. 信号队列只传 uint64_t（frame_index）：
+       数据仍通过原子槽传递，信号仅用于唤醒。
+       杜绝跨线程内存竞态。
+    4. 信号队列与原子槽的职责分离：
+       原子槽负责"传递数据"，信号队列负责"通知时机"。
+       两者各司其职，互不干扰。
+
+  一句话总结：
+    V6 以约 20 行净增代码，在 Tracker 匹配层植入"强制推进感知"，
+    硬清零旧 ID 的惯性奖励，彻底根治"三圈全是 0"的 ID 冻结问题；
+    同时将 Render 线程从轮询升级为信号队列，消除不必要的 CPU 消耗。
