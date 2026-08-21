@@ -8,7 +8,10 @@
 #include "rm_autoaim/Types.hpp"
 
 #include <atomic>
+#include <condition_variable>
 #include <memory>
+#include <mutex>
+#include <queue>
 #include <string>
 #include <thread>
 #include <vector>
@@ -58,8 +61,15 @@ private:
   Predictor predictor_;
   BallisticSolver ballistic_;
 
+  // V7.1: Bounded frame queue — replaces single-slot atomic for Reader→Detector
+  // Absorbs transient jitter: even if Detector runs 6ms, the 5-frame buffer
+  // prevents version-skip induced frame loss. Reader drops oldest when full.
+  static constexpr size_t kMaxFrameQueueSize{5};
+  std::queue<std::shared_ptr<FrameData>> frame_queue_;
+  std::mutex frame_queue_mutex_;
+  std::condition_variable frame_queue_cv_;
+
   // Lock-free slots: atomic<shared_ptr<T>> with version-based deduplication
-  std::shared_ptr<std::atomic<std::shared_ptr<FrameData>>> frame_slot_;
   std::shared_ptr<std::atomic<std::shared_ptr<std::vector<Armor2D>>>> det_slot_;
   std::shared_ptr<std::atomic<std::shared_ptr<std::vector<TrackedArmor>>>>
       track_slot_;
@@ -68,7 +78,6 @@ private:
   std::shared_ptr<std::atomic<std::shared_ptr<std::vector<AimAngle>>>>
       aim_slot_;
 
-  std::atomic<uint64_t> frame_version_{0};
   std::atomic<uint64_t> det_version_{0};
   std::atomic<uint64_t> track_version_{0};
   std::atomic<uint64_t> pred_version_{0};
@@ -102,6 +111,12 @@ private:
   std::atomic<bool> render_running_{false};
   int render_frame_counter_{0};
   static constexpr int kVizDecimate{3};
+
+  // V6/V7.1: Render signal queue — mutex+cv, Detector pushes frame_index,
+  // Render thread blocks on cv instead of polling.
+  std::queue<uint64_t> render_signal_queue_;
+  std::mutex render_signal_mutex_;
+  std::condition_variable render_signal_cv_;
 };
 
 }  // namespace rm_autoaim

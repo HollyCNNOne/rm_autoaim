@@ -2,10 +2,57 @@
 
 #include <chrono>
 
+#ifdef __linux__
+#include <pthread.h>
+#include <unistd.h>
+#endif
+
 #include <opencv2/imgproc.hpp>
 #include <spdlog/spdlog.h>
 
 namespace rm_autoaim {
+
+// ============================================================================
+// V7.1: Real-time helpers (Linux only, graceful fallback on other platforms)
+// ============================================================================
+
+#ifdef __linux__
+namespace {
+
+[[maybe_unused]] auto promote_to_realtime() -> void {
+  struct sched_param param;
+  param.sched_priority = 99;
+  if (pthread_setschedparam(pthread_self(), SCHED_FIFO, &param) == 0) {
+    spdlog::info("[V7.1] Thread promoted to SCHED_FIFO (prio=99)");
+  } else if (nice(-20) != -1) {
+    spdlog::warn("[V7.1] SCHED_FIFO failed, fell back to nice(-20)");
+  } else {
+    spdlog::warn("[V7.1] Realtime promotion failed, using default scheduler");
+  }
+}
+
+[[maybe_unused]] auto bind_to_core(int core) -> void {
+  cpu_set_t cpuset;
+  CPU_ZERO(&cpuset);
+  CPU_SET(core, &cpuset);
+  if (pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset) == 0) {
+    spdlog::info("[V7.1] Thread bound to core {}", core);
+  } else {
+    spdlog::warn("[V7.1] Failed to bind thread to core {}", core);
+  }
+}
+
+}  // anonymous namespace
+#else
+namespace {
+[[maybe_unused]] auto promote_to_realtime() -> void {
+  spdlog::info("[V7.1] Real-time priority not available on this platform");
+}
+[[maybe_unused]] auto bind_to_core(int /*core*/) -> void {
+  // no-op on non-Linux platforms
+}
+}  // anonymous namespace
+#endif
 
 auto Pipeline::PerfCounter::record_start() -> void {
   start = std::chrono::steady_clock::now();
@@ -19,8 +66,6 @@ auto Pipeline::PerfCounter::record_end() -> double {
 
 Pipeline::Pipeline(const std::string& video_path)
     : reader_(video_path)
-    , frame_slot_(
-          std::make_shared<std::atomic<std::shared_ptr<FrameData>>>())
     , det_slot_(
           std::make_shared<std::atomic<std::shared_ptr<std::vector<Armor2D>>>>())
     , track_slot_(
@@ -77,6 +122,10 @@ auto Pipeline::stop() -> void {
   predictor_thread_.request_stop();
   ballistic_thread_.request_stop();
 
+  // V7.1: Wake all threads blocked on queues
+  frame_queue_cv_.notify_all();
+  render_signal_cv_.notify_all();
+
   if (render_running_.load()) {
     render_thread_.request_stop();
   }
@@ -120,7 +169,6 @@ auto Pipeline::is_done() const -> bool { return done_.load(); }
 auto Pipeline::reader_thread_fn(std::stop_token st) -> void {
   spdlog::info("[Reader] thread started");
   PerfCounter perf;
-  const FrameData* last_frame = nullptr;
 
   while (!st.stop_requested()) {
     perf.record_start();
@@ -128,16 +176,15 @@ auto Pipeline::reader_thread_fn(std::stop_token st) -> void {
     double latency = perf.record_end();
 
     if (frame) {
-      if (frame.get() == last_frame) {
-        if (reader_.is_done()) break;
-        std::this_thread::sleep_for(std::chrono::microseconds(100));
-        continue;
+      // V7.1: Bounded queue — drop oldest if full, non-blocking push
+      {
+        std::lock_guard<std::mutex> lock(frame_queue_mutex_);
+        if (frame_queue_.size() >= kMaxFrameQueueSize) {
+          frame_queue_.pop();  // drop oldest
+        }
+        frame_queue_.push(frame);
       }
-      last_frame = frame.get();
-
-      frame_slot_->store(frame);
-      frame_version_.fetch_add(1, std::memory_order_release);
-      frame_slot_->notify_all();
+      frame_queue_cv_.notify_one();
 
       stats_.reader.frames_processed++;
       stats_.reader.min_latency_us =
@@ -156,29 +203,36 @@ auto Pipeline::reader_thread_fn(std::stop_token st) -> void {
   }
 
   done_.store(true);
+  frame_queue_cv_.notify_all();  // wake detector to exit
   spdlog::info("[Reader] thread finished");
 }
 
 auto Pipeline::detector_thread_fn(std::stop_token st) -> void {
   spdlog::info("[Detector] thread started");
+
+  // V7.1: Realtime priority — SCHED_FIFO prio=99, fallback nice(-20)
+  promote_to_realtime();
+  // V7.1: CPU affinity — isolate Detector on core 0, eliminate cache thrashing
+  bind_to_core(0);
+
   PerfCounter perf;
-  uint64_t last_version = 0;
 
   while (!st.stop_requested()) {
-    auto frame = frame_slot_->load();
-    if (!frame) {
-      if (done_.load()) break;
-      std::this_thread::sleep_for(std::chrono::microseconds(100));
-      continue;
+    // V7.1: Blocking dequeue with timeout — absorbs transient jitter
+    std::shared_ptr<FrameData> frame;
+    {
+      std::unique_lock<std::mutex> lock(frame_queue_mutex_);
+      bool got = frame_queue_cv_.wait_for(
+          lock, std::chrono::milliseconds(5),
+          [this, &st] { return !frame_queue_.empty() || st.stop_requested(); });
+      if (!got) {
+        if (done_.load()) break;
+        continue;
+      }
+      if (st.stop_requested() && frame_queue_.empty()) break;
+      frame = frame_queue_.front();
+      frame_queue_.pop();
     }
-
-    uint64_t cur_version = frame_version_.load(std::memory_order_acquire);
-    if (cur_version == last_version) {
-      if (done_.load()) break;
-      std::this_thread::sleep_for(std::chrono::microseconds(100));
-      continue;
-    }
-    last_version = cur_version;
 
     perf.record_start();
     auto [detections, det_debug] = detector_.detect_debug(frame->image);
@@ -195,6 +249,15 @@ auto Pipeline::detector_thread_fn(std::stop_token st) -> void {
       auto debug_info =
           std::make_shared<Detector::DetectorDebugInfo>(std::move(det_debug));
       debug_det_slot_->store(debug_info);
+
+      // V7.1: Signal render thread via mutex+cv queue
+      {
+        std::lock_guard<std::mutex> lock(render_signal_mutex_);
+        if (render_signal_queue_.size() < 60) {
+          render_signal_queue_.push(frame->frame_index);
+          render_signal_cv_.notify_one();
+        }
+      }
     }
 
     stats_.detector.frames_processed++;
@@ -464,6 +527,10 @@ auto Pipeline::draw_debug_frame(
 auto Pipeline::render_thread_fn(std::stop_token st) -> void {
   spdlog::info("[Render] thread started");
 
+  // V7.1: CPU affinity — isolate Render on core 1 (if available)
+  // Keeps Render's memory traffic off Detector's L3 cache lines.
+  bind_to_core(1);
+
   cv::VideoWriter writer;
   writer.open(debug_viz_path_,
               cv::VideoWriter::fourcc('M', 'J', 'P', 'G'),
@@ -475,16 +542,21 @@ auto Pipeline::render_thread_fn(std::stop_token st) -> void {
     return;
   }
 
-  uint64_t last_det_version = 0;
-
   while (!st.stop_requested()) {
-    uint64_t cur_version = det_version_.load(std::memory_order_acquire);
-    if (cur_version == last_det_version) {
-      if (done_.load()) break;
-      std::this_thread::sleep_for(std::chrono::microseconds(500));
-      continue;
+    // V7.1: Block on signal cv instead of polling — no spin-wait
+    {
+      std::unique_lock<std::mutex> lock(render_signal_mutex_);
+      render_signal_cv_.wait(lock, [this, &st] {
+        return !render_signal_queue_.empty() || st.stop_requested();
+      });
+      if (st.stop_requested() && render_signal_queue_.empty()) {
+        break;
+      }
+      // Drain all accumulated signals
+      while (!render_signal_queue_.empty()) {
+        render_signal_queue_.pop();
+      }
     }
-    last_det_version = cur_version;
 
     // Decimate: draw only 1 frame every kVizDecimate
     if (++render_frame_counter_ % kVizDecimate != 0) continue;
@@ -495,6 +567,23 @@ auto Pipeline::render_thread_fn(std::stop_token st) -> void {
     auto tracks = track_slot_->load();
     auto aims = aim_slot_->load();
 
+    if (debug_frame && debug_det && dets && tracks) {
+      auto viz = draw_debug_frame(*debug_frame, *debug_det, *dets, *tracks,
+                                  aims ? *aims : std::vector<AimAngle>{});
+      cv::Mat viz_small;
+      cv::resize(viz, viz_small, cv::Size(960, 600));
+      writer.write(viz_small);
+    }
+  }
+
+  // V7.2: Final flush — write last frame to disk before releasing VideoWriter.
+  // Ensures debug_viz.avi contains all frames, not truncated.
+  {
+    auto debug_frame = debug_frame_slot_->load();
+    auto debug_det = debug_det_slot_->load();
+    auto dets = det_slot_->load();
+    auto tracks = track_slot_->load();
+    auto aims = aim_slot_->load();
     if (debug_frame && debug_det && dets && tracks) {
       auto viz = draw_debug_frame(*debug_frame, *debug_det, *dets, *tracks,
                                   aims ? *aims : std::vector<AimAngle>{});
