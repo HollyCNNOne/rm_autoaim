@@ -11,11 +11,6 @@
 namespace rm_autoaim {
 
 // ============================================================================
-// Static constexpr out-of-class definition (C++17 ODR)
-// ============================================================================
-constexpr double Tracker::kPhaseOffsets[3];
-
-// ============================================================================
 // Helper: compute median of a deque<double>
 // ============================================================================
 namespace {
@@ -416,7 +411,15 @@ auto Tracker::tracks() const -> std::vector<TrackedArmor> {
   std::vector<TrackedArmor> result;
   for (int i = 0; i < kMaxSlots; ++i) {
     if (slot_status_[i] != SlotStatus::kInactive) {
-      result.push_back(slots_[i]);
+      auto t = slots_[i];
+      // Map SlotStatus to TrackedArmor::Status for downstream visualization
+      switch (slot_status_[i]) {
+      case SlotStatus::kTentative: t.status = TrackedArmor::Status::kTentative; break;
+      case SlotStatus::kConfirmed: t.status = TrackedArmor::Status::kConfirmed; break;
+      case SlotStatus::kLost:      t.status = TrackedArmor::Status::kLost; break;
+      default: break;
+      }
+      result.push_back(t);
     }
   }
   return result;

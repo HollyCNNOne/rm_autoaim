@@ -72,7 +72,7 @@ private:
   // Phase slots: 3 fixed armor plates, each with a fixed phase offset
   // =========================================================================
   static constexpr int kMaxSlots{3};
-  static constexpr double kPhaseOffsets[3];  // {0, 2π/3, 4π/3}
+  static constexpr double kPhaseOffsets[3] = {0.0, 2.0 * M_PI / 3.0, 4.0 * M_PI / 3.0};
   static constexpr int kTimeoutFrames{15};   // lease: ~90ms @ 166.7FPS
   static constexpr double kNominalDt{1.0 / 166.7};
 
